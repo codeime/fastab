@@ -336,3 +336,17 @@ jobs:
           done | tee target/fterm-footprint.txt
           table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/fterm-footprint.txt)"
           echo "::notice title=fterm footprint::${table}"
+
+      # Two latencies no test pins, published the same way: what `ftab init`
+      # adds to every shell start, and the first completion after the engine
+      # retired its caches (10 s after input ends) against a warm one.
+      - name: Measure shell startup and cold completion
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          python3 scripts/shell-startup-cost.py target/dist/ftab | tee target/shell-startup.txt
+          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/shell-startup.txt)"
+          echo "::notice title=shell startup (ms)::${table}"
+          cargo run --locked --profile dist -p fastab_engine --example cold-load -- bundle/specs-ir | tee target/cold-load.txt
+          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/cold-load.txt)"
+          echo "::notice title=cold completion (ms)::${table}"

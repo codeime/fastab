@@ -5,7 +5,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, LazyLock, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, Instant, SystemTime};
 
 use crate::filegen;
 use crate::ir::{ArgSpec, Builtin, GeneratorSpec, GeneratorTrigger, Spec, SuggestionMeta, Template};
@@ -38,6 +38,10 @@ fn hidden_static_seed_is_visible(seed: &crate::ir::SuggestionSeed, query: &str, 
 pub const DEFAULT_SCRIPT_TIMEOUT_MS: i64 = 5_000;
 const MAX_RESULTS: usize = 50;
 const MAX_CACHED: usize = 32;
+/// A generator whose last run took at least this long waits for a follow-up
+/// request when the caller opts in, so the static rows do not wait for it.
+const SLOW_GENERATOR: Duration = Duration::from_millis(80);
+const MAX_SLOW_GENERATORS: usize = 256;
 
 pub(crate) fn configured_script_timeout_ms() -> i64 {
     configured_script_timeout_ms_from(&fastab_settings::settings::Settings::new())
@@ -113,7 +117,9 @@ impl GeneratorSession {
 
 thread_local! {
     static GENERATOR_SESSION: RefCell<GeneratorSession> = RefCell::new(GeneratorSession::default());
-    static PENDING_GENERATORS: Cell<(bool, i64)> = const { Cell::new((false, 0)) };
+    /// Follow-up delay in ms, once a generator was deferred this request.
+    static PENDING_GENERATORS: Cell<Option<i64>> = const { Cell::new(None) };
+    static DEFER_SLOW_GENERATORS: Cell<bool> = const { Cell::new(false) };
     static HISTORY: RefCell<Arc<crate::history::HistoryStore>> = RefCell::new(Arc::default());
 }
 
@@ -141,18 +147,71 @@ pub(crate) fn history_store() -> Arc<crate::history::HistoryStore> {
 }
 
 pub fn take_pending_generators() -> (bool, Option<i64>) {
-    PENDING_GENERATORS.with(|cell| {
-        let (pending, debounce_ms) = cell.replace((false, 0));
-        if pending {
-            (true, Some(if debounce_ms > 0 { debounce_ms } else { 200 }))
-        } else {
-            (false, None)
-        }
+    PENDING_GENERATORS.with(|cell| match cell.take() {
+        Some(delay_ms) => (true, Some(delay_ms)),
+        None => (false, None),
     })
 }
 
-fn set_pending_generators(debounce_ms: i64) {
-    PENDING_GENERATORS.with(|cell| cell.set((true, debounce_ms)));
+/// Generators deferred by one request share the earliest follow-up.
+fn set_pending_generators(delay_ms: i64) {
+    PENDING_GENERATORS.with(|cell| cell.set(Some(cell.get().map_or(delay_ms, |pending| pending.min(delay_ms)))));
+}
+
+/// Only the desktop overlay answers `pending_generators` with a follow-up
+/// request, so only it may leave a known-slow generator for that request.
+/// The CLI and golden cases take one request per result and run everything.
+pub(crate) fn set_defer_slow_generators(enabled: bool) {
+    DEFER_SLOW_GENERATORS.with(|cell| cell.set(enabled));
+}
+
+/// Fig ran every generator as its own promise and drew the static rows while
+/// they loaded. Deferring all of them would make a fast `git branch` flicker in
+/// a frame after the options, so only generators that ran slow last time wait.
+/// Path and history templates never do: they retrigger on most keystrokes, and
+/// with a `getQueryTerm` each follow-up would blank the list while it ran.
+fn generator_may_defer(arg: &ArgSpec, generator: &GeneratorSpec) -> bool {
+    let runs_command = !generator.script.is_empty()
+        || generator.js_script.is_some()
+        || generator.js_custom.is_some()
+        || generator.builtin.is_some()
+        || (arg.generators.is_empty() && (arg.builtin.is_some() || !arg.builtins.is_empty()));
+    runs_command && !generator_lists_paths(generator, arg) && !generator.templates.contains(&Template::History)
+}
+
+/// One generator across directories and argument slots, unlike
+/// [`generator_arg_id`], which also keys the cwd and the typed tokens.
+fn generator_speed_key(arg: &ArgSpec, generator: &GeneratorSpec) -> String {
+    format!(
+        "{}::{:?}::{:?}::{}::{}::{}",
+        arg.name,
+        generator.builtin.or(arg.builtin),
+        arg.builtins,
+        generator.js_custom.as_deref().unwrap_or(""),
+        generator.js_script.as_deref().unwrap_or(""),
+        generator.script.join("\x1f")
+    )
+}
+
+fn generator_is_known_slow(key: &str) -> bool {
+    SLOW_GENERATORS
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .contains(key)
+}
+
+/// Remember how the last run went. A run cancelled early says nothing about
+/// speed, but one cancelled after the budget had already passed was slow.
+fn note_generator_speed(key: String, elapsed: Duration, cancelled: bool) {
+    let mut slow = SLOW_GENERATORS.lock().unwrap_or_else(|error| error.into_inner());
+    if elapsed >= SLOW_GENERATOR {
+        if slow.len() >= MAX_SLOW_GENERATORS && !slow.contains(&key) {
+            slow.clear();
+        }
+        slow.insert(key);
+    } else if !cancelled {
+        slow.remove(&key);
+    }
 }
 
 fn generator_arg_id(tokens: &[String], arg: &ArgSpec, cwd: &str, search_term: &str) -> String {
@@ -252,6 +311,9 @@ impl<T: Clone> MtimeLru<T> {
 static GIT_REFS: LazyLock<Mutex<MtimeLru<Arc<[String]>>>> = LazyLock::new(|| Mutex::new(MtimeLru::default()));
 static PACKAGE_JSON: LazyLock<Mutex<MtimeLru<Arc<serde_json::Value>>>> =
     LazyLock::new(|| Mutex::new(MtimeLru::default()));
+/// [`generator_speed_key`]s whose last run reached [`SLOW_GENERATOR`]. Process
+/// wide: a cancelled request drops its session, and the mark must survive it.
+static SLOW_GENERATORS: LazyLock<Mutex<HashSet<String>>> = LazyLock::new(|| Mutex::new(HashSet::new()));
 
 /// Compatibility wrapper used by generator-focused tests and callers that do
 /// not already have a resolved lookup context.  The completion path calls
@@ -349,8 +411,10 @@ pub(crate) fn generate_for_arg_with_history(
     let generators = effective_generators(arg);
     let arg_id = generator_arg_id(tokens, arg, cwd, search_term);
     let debounce = arg.debounce_ms.is_some();
-    let debounce_ms = arg.debounce_ms.unwrap_or(200);
-    let mut pending = false;
+    // Fig waited 200ms for `debounce: true` and for a non-positive number.
+    let debounce_ms = arg.debounce_ms.filter(|ms| *ms > 0).unwrap_or(200);
+    let defer_slow = !debounce && DEFER_SLOW_GENERATORS.with(Cell::get);
+    let mut pending_ms: Option<i64> = None;
     GENERATOR_SESSION.with(|session| {
         let mut session = session.borrow_mut();
         let arg_changed = session.arg_id != arg_id;
@@ -387,22 +451,25 @@ pub(crate) fn generate_for_arg_with_history(
                     .or(arg.js_get_query_term.as_deref())
                     .or(arg.meta.js_get_query_term.as_deref()),
             );
-            let follow_up = debounce
-                && !arg_changed
-                && session.entries[index].needs_run
-                && session.search_term == normalized_search_term;
+            let speed_key =
+                (defer_slow && generator_may_defer(arg, generator)).then(|| generator_speed_key(arg, generator));
+            let deferred = debounce || speed_key.as_deref().is_some_and(generator_is_known_slow);
+            // Only a deferral sets `needs_run`, so this is the request it asked for.
+            let follow_up =
+                !arg_changed && session.entries[index].needs_run && session.search_term == normalized_search_term;
             let has_query_rule = generator.get_query_term.is_some()
                 || generator.js_get_query_term.is_some()
                 || arg.meta.get_query_term.is_some()
                 || arg.js_get_query_term.is_some()
                 || arg.meta.js_get_query_term.is_some();
-            let mut rows = if debounce && !follow_up && (trigger || arg_changed) {
+            let mut rows = if deferred && !follow_up && (trigger || arg_changed) {
                 session.entries[index].needs_run = true;
-                pending = true;
+                let delay_ms = if debounce { debounce_ms } else { 0 };
+                pending_ms = Some(pending_ms.map_or(delay_ms, |pending| pending.min(delay_ms)));
                 // Fig kept a loading generator's previous rows on screen only
                 // when it had no `getQueryTerm`: with one, the old rows may
                 // not filter correctly against the new term, so they are
-                // withheld until the debounced run lands.
+                // withheld until the deferred run lands.
                 if has_query_rule {
                     Vec::new()
                 } else {
@@ -411,6 +478,7 @@ pub(crate) fn generate_for_arg_with_history(
             } else if !trigger && !follow_up {
                 refilter_generated(&session.entries[index].results, &gen_query, fuzzy)
             } else {
+                let started = Instant::now();
                 let mut rows = generate_from_generator(
                     arg,
                     generator,
@@ -422,7 +490,11 @@ pub(crate) fn generate_for_arg_with_history(
                     fuzzy,
                     timeout,
                 );
-                if crate::cancellation::is_cancelled() {
+                let cancelled = crate::cancellation::is_cancelled();
+                if let Some(key) = speed_key {
+                    note_generator_speed(key, started.elapsed(), cancelled);
+                }
+                if cancelled {
                     return;
                 }
                 dedup_session_rows(&mut rows);
@@ -441,8 +513,8 @@ pub(crate) fn generate_for_arg_with_history(
     if crate::cancellation::is_cancelled() {
         return Vec::new();
     }
-    if pending {
-        set_pending_generators(debounce_ms);
+    if let Some(delay_ms) = pending_ms {
+        set_pending_generators(delay_ms);
     }
     if arg.meta.is_dangerous {
         for suggestion in &mut out {
@@ -2186,6 +2258,93 @@ mod tests {
         assert!(pending);
         assert_eq!(names, vec!["alpha"]);
         install_session(GeneratorSession::default());
+    }
+
+    fn slow_script_arg(name: &str) -> ArgSpec {
+        ArgSpec {
+            name: name.into(),
+            script: vec!["sh".into(), "-c".into(), "sleep 0.1; printf 'alpha\\nbeta\\n'".into()],
+            split_on: Some("\n".into()),
+            ..ArgSpec::default()
+        }
+    }
+
+    fn run_slot(arg: &ArgSpec, slot: &str, cwd: &str) -> (Vec<String>, (bool, Option<i64>)) {
+        let tokens = vec!["tool".to_string(), slot.to_string()];
+        let rows = generate_for_arg_with_search_term(arg, &tokens, "", "", cwd, false);
+        (
+            rows.into_iter().map(|row| row.name).collect(),
+            take_pending_generators(),
+        )
+    }
+
+    #[test]
+    fn a_known_slow_generator_waits_for_an_immediate_follow_up() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        let arg = slow_script_arg("slow-follow-up");
+        set_defer_slow_generators(true);
+        install_session(GeneratorSession::default());
+        // Nothing is known about the generator yet, so it runs inline.
+        let (names, pending) = run_slot(&arg, "one", &cwd);
+        assert_eq!(names, vec!["alpha", "beta"]);
+        assert_eq!(pending, (false, None));
+        // A new slot: the last run was slow, so the rows wait for a follow-up
+        // with no delay instead of holding up the rest of the list.
+        let (names, pending) = run_slot(&arg, "two", &cwd);
+        assert!(names.is_empty(), "{names:?}");
+        assert_eq!(pending, (true, Some(0)));
+        let (names, pending) = run_slot(&arg, "two", &cwd);
+        assert_eq!(names, vec!["alpha", "beta"]);
+        assert_eq!(pending, (false, None));
+        set_defer_slow_generators(false);
+        install_session(GeneratorSession::default());
+    }
+
+    #[test]
+    fn slow_generators_stay_inline_for_callers_without_follow_ups() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        let arg = slow_script_arg("slow-inline");
+        install_session(GeneratorSession::default());
+        for slot in ["one", "two"] {
+            let (names, pending) = run_slot(&arg, slot, &cwd);
+            assert_eq!(names, vec!["alpha", "beta"], "{slot}");
+            assert_eq!(pending, (false, None), "{slot}");
+        }
+        install_session(GeneratorSession::default());
+    }
+
+    #[test]
+    fn generator_speed_follows_the_last_run_that_finished() {
+        let key = "speed-mark-test";
+        note_generator_speed(key.into(), SLOW_GENERATOR, false);
+        assert!(generator_is_known_slow(key));
+        // Cancelled early: no evidence that the generator got faster.
+        note_generator_speed(key.into(), Duration::ZERO, true);
+        assert!(generator_is_known_slow(key));
+        note_generator_speed(key.into(), Duration::ZERO, false);
+        assert!(!generator_is_known_slow(key));
+    }
+
+    #[test]
+    fn only_generators_that_run_commands_can_be_deferred() {
+        let may_defer = |arg: &ArgSpec| generator_may_defer(arg, &effective_generators(arg)[0]);
+        let script = ArgSpec {
+            script: vec!["true".into()],
+            ..ArgSpec::default()
+        };
+        assert!(may_defer(&script));
+        let paths = ArgSpec {
+            templates: vec![Template::Filepaths],
+            ..script.clone()
+        };
+        assert!(!may_defer(&paths));
+        let history = ArgSpec {
+            templates: vec![Template::History],
+            ..ArgSpec::default()
+        };
+        assert!(!may_defer(&history));
     }
 
     #[test]

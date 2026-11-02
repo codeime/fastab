@@ -1266,6 +1266,9 @@ impl OverlayController {
             environment_variables,
             alias,
             include_public_ai: self.jev.is_ready(),
+            // `apply_completion` schedules the follow-up a pending
+            // result asks for, so slow generators need not hold up the list.
+            defer_slow_generators: true,
         };
         self.capture_jev_request_context(&request, session_id);
         // Submit before spawning: queue order is the input-event order, not

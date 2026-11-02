@@ -444,6 +444,16 @@ function __fig_preexec_preserve_status() {
   __bp_set_ret_value "${__fig_ret_value}" "${__bp_last_argument_prev_command:?}"
 }
 
+# Start the pre-cmd process only when the exports or aliases changed since the
+# last prompt. `export -p` and `alias` are builtins: one subshell, no exec.
+function __fig_update_shell_context () {
+  local fig_context
+  fig_context="$(export -p; \alias)"
+  [[ "${fig_context}" == "${__fig_shell_context-}" ]] && return
+  __fig_shell_context="${fig_context}"
+  (command ftab _ pre-cmd --alias "$(\alias)" > /dev/null 2>&1 &) >/dev/null 2>&1
+}
+
 function __fig_pre_prompt () {
   __fig_ret_value="$?"
 
@@ -461,7 +471,7 @@ function __fig_pre_prompt () {
   fig_osc "User=%s" "${USER:-root}"
 
   if command -v ftab >/dev/null 2>&1; then
-    (command ftab _ pre-cmd --alias "$(\alias)" > /dev/null 2>&1 &) >/dev/null 2>&1
+    __fig_update_shell_context
   fi
 
   # Work around bug in CentOS 7.2 where preexec doesn't run if you press ^C
@@ -570,6 +580,7 @@ if [[ -n "${PROCESS_LAUNCHED_BY_Q:-}" ]]; then
   fig_osc DoneSourcing
 fi
 
-fi
+# Records the context, so an unchanged first prompt starts nothing.
+__fig_update_shell_context
 
-(command ftab _ pre-cmd --alias "$(\alias)" > /dev/null 2>&1 &) >/dev/null 2>&1
+fi

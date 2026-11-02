@@ -56,6 +56,15 @@ function fig_preexec --on-event fish_preexec
     set fig_has_set_prompt 0
 end
 
+# Start the pre-cmd process only when the exports or aliases changed since the
+# last prompt. `set -x` is a builtin and `alias` a function: no fork.
+function fig_update_shell_context
+    set -l context (set -x) (alias)
+    test "$context" = "$fig_shell_context"; and return
+    set -g fig_shell_context $context
+    begin; command ftab _ pre-cmd --alias (alias) &> /dev/null &; end
+end
+
 function fig_precmd --on-event fish_prompt
     set -l last_status $status
 
@@ -105,7 +114,7 @@ function fig_precmd --on-event fish_prompt
     set fig_has_set_prompt 1
 
     if command -v ftab &>/dev/null
-        begin; command ftab _ pre-cmd --alias (alias) &> /dev/null &; end
+        fig_update_shell_context
     end
 end
 
@@ -115,4 +124,5 @@ if test -n "$PROCESS_LAUNCHED_BY_Q"
     fig_osc DoneSourcing
 end
 
-begin; command ftab _ pre-cmd --alias (alias) &> /dev/null &; end
+# Records the context, so an unchanged first prompt starts nothing.
+fig_update_shell_context

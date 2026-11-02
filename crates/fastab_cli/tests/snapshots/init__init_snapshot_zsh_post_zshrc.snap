@@ -80,6 +80,25 @@ fig_preexec() {
   fig_osc PreExec
 }
 
+# Start the pre-cmd process only when the exports or aliases changed since the
+# last prompt. zsh/parameter lists them without a fork; `_` changes with every
+# command, so it is left out.
+fig_update_shell_context() {
+  local fig_name fig_context=""
+  if zmodload -e zsh/parameter; then
+    # shellcheck disable=SC2296
+    for fig_name in ${(ko)parameters[(R)*export*]:#_}; do
+      # shellcheck disable=SC2296
+      fig_context+="${fig_name}=${(P)fig_name}"$'\x1f'
+    done
+    # shellcheck disable=SC2296
+    fig_context+="${(kv)aliases}"$'\x1f'"${(kv)galiases}"$'\x1f'"${(kv)saliases}"
+    [[ "${fig_context}" == "${Q_SHELL_CONTEXT-}" ]] && return
+  fi
+  typeset -g Q_SHELL_CONTEXT="${fig_context}"
+  (command ftab _ pre-cmd --alias "$(\alias)" > /dev/null 2>&1 &) >/dev/null 2>&1
+}
+
 fig_precmd() {
   local LAST_STATUS=$?
 
@@ -172,7 +191,7 @@ fig_precmd() {
   Q_HAS_SET_PROMPT=1
 
   if command -v ftab >/dev/null 2>&1; then
-    (command ftab _ pre-cmd --alias "$(\alias)" > /dev/null 2>&1 &) >/dev/null 2>&1
+    fig_update_shell_context
   fi
 }
 
@@ -194,6 +213,9 @@ if [[ -n "${PROCESS_LAUNCHED_BY_Q:-}" ]]; then
   fig_osc DoneSourcing
 fi
 
-fi
+# zsh/parameter is autoloaded on first use; load it so `zmodload -e` sees it.
+zmodload -i zsh/parameter 2>/dev/null
+# Records the context, so an unchanged first prompt starts nothing.
+fig_update_shell_context
 
-(command ftab _ pre-cmd --alias "$(\alias)" > /dev/null 2>&1 &) >/dev/null 2>&1
+fi

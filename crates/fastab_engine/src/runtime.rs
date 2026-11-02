@@ -36,6 +36,10 @@ pub struct CompleteRequest {
     /// Desktop-only opt-in. Never enabled by serialized CLI/protocol input.
     #[serde(skip)]
     pub include_public_ai: bool,
+    /// Desktop-only: the caller re-requests on `pending_generators`, so a
+    /// generator that ran slow last time can wait for that follow-up.
+    #[serde(skip)]
+    pub defer_slow_generators: bool,
     pub buffer: String,
     #[serde(default)]
     pub cwd: String,
@@ -77,6 +81,7 @@ impl Default for CompleteRequest {
     fn default() -> Self {
         Self {
             include_public_ai: false,
+            defer_slow_generators: false,
             buffer: String::new(),
             cwd: String::new(),
             cursor: None,
@@ -761,7 +766,9 @@ impl Engine {
         let history_only = request.history_only;
         crate::generate::take_pending_generators();
         crate::generate::install_session(std::mem::take(&mut self.generator_session));
+        crate::generate::set_defer_slow_generators(request.defer_slow_generators);
         let result = self.complete_with_thread_session(request);
+        crate::generate::set_defer_slow_generators(false);
         let session = crate::generate::take_session();
         match crate::cancellation::finish_if_active(|| {
             self.generator_session = session;

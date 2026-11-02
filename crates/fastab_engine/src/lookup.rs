@@ -3656,6 +3656,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3683,6 +3684,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3709,6 +3711,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3734,6 +3737,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3759,6 +3763,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3784,6 +3789,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3809,6 +3815,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3835,6 +3842,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3860,6 +3868,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -3884,6 +3893,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: Some("alias g=git\n".into()),
             },
         );
@@ -3911,6 +3921,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: Some("alias g=git\n".into()),
             },
         );
@@ -3953,6 +3964,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: Some("alias g=git\n".into()),
             },
         );
@@ -4043,6 +4055,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -4087,6 +4100,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -4121,6 +4135,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -4149,6 +4164,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
@@ -5926,6 +5942,7 @@ mod tests {
                 current_process: None,
                 environment_variables: Default::default(),
                 include_public_ai: false,
+                defer_slow_generators: false,
                 alias: None,
             },
         );
