@@ -5,7 +5,7 @@ expression: init
 ---
 set -g Q_SHELL "/bin/zsh"
 set -g SHOULD_QTERM_LAUNCH "0"
-command mkdir -p ~/.local/bin >/dev/null
+test -d ~/.local/bin; or command mkdir -p ~/.local/bin >/dev/null
 
 builtin contains $HOME/.local/bin $PATH
 or set --append PATH $HOME/.local/bin

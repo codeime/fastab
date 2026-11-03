@@ -1,4 +1,4 @@
-command mkdir -p ~/.local/bin >/dev/null
+test -d ~/.local/bin; or command mkdir -p ~/.local/bin >/dev/null
 
 builtin contains $HOME/.local/bin $PATH
 or set --append PATH $HOME/.local/bin

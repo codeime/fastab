@@ -55,7 +55,11 @@ def main():
         shell = ["/bin/zsh", "-i", "-c", "exit"]
         cases = [
             ("/usr/bin/true", ["/usr/bin/true"], base),
+            ("ftab --version (clap, no runtime)", [ftab, "--version"], base),
             ("ftab _ pre-cmd (launch only)", [ftab, "_", "pre-cmd"], base),
+            ("ftab _ get-shell", [ftab, "_", "get-shell"], base),
+            ("ftab _ should-figterm-launch", [ftab, "_", "should-figterm-launch"], app_up),
+            ("ftab init zsh pre, app down", [ftab, "init", "zsh", "pre", "--rcfile", "zshrc"], app_down),
             ("ftab init zsh pre", [ftab, "init", "zsh", "pre", "--rcfile", "zshrc"], app_up),
             ("ftab init zsh post", [ftab, "init", "zsh", "post", "--rcfile", "zshrc"], app_up),
             ("zsh -i, no integration", shell, dict(base, ZDOTDIR=bare)),

@@ -20,10 +20,27 @@ fn main() -> Result<ExitCode> {
 
     let mut args = std::env::args();
     let subcommand = args.nth(1);
-    let multithread = matches!(
-        subcommand.as_deref(),
-        Some("init" | "_" | "internal" | "completion" | "hook")
-    );
+    // Every shell start runs `init` (several times for a login shell) and
+    // every prompt may run `pre-cmd`. They await nothing that needs a second
+    // thread, so they skip the per-core worker pool, and they open SQLite
+    // directly instead of starting a pool and its maintenance thread for one
+    // or two reads, as fterm does.
+    let shell_hot_path = match subcommand.as_deref() {
+        Some("init") => true,
+        Some("_" | "internal") => matches!(
+            args.next().as_deref(),
+            Some("pre-cmd" | "should-figterm-launch" | "get-shell")
+        ),
+        _ => false,
+    };
+    if shell_hot_path {
+        fastab_settings::sqlite::prefer_direct_connections();
+    }
+    let multithread = !shell_hot_path
+        && matches!(
+            subcommand.as_deref(),
+            Some("init" | "_" | "internal" | "completion" | "hook")
+        );
 
     let parsed = match cli::Cli::try_parse() {
         Ok(cli) => cli,
