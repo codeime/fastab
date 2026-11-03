@@ -21,6 +21,12 @@ const MAX_CACHE_ENTRIES: usize = 512;
 /// Each of the three maps gets this budget; an oversized result is still served
 /// to its caller, but is not retained for another request.
 const MAX_CACHE_BYTES: usize = 4 * 1024 * 1024;
+/// Generated specs kept through the idle grace. Fig cached each parse,
+/// `generateSpec` included, for the whole session; dropping them meant
+/// `git help -a` or `cargo --list` ran again on the first keystroke of every
+/// command typed after a pause (24 ms and ~100 ms on CI). A map over this
+/// estimate is cleared like the generator maps.
+const IDLE_SPEC_CACHE_BYTES: usize = 256 * 1024;
 
 thread_local! {
     static CURRENT: std::cell::RefCell<Option<Arc<HookCache>>> = const { std::cell::RefCell::new(None) };
@@ -213,7 +219,27 @@ impl HookCache {
         self.spec_cache.lock().unwrap_or_else(|err| err.into_inner()).clear();
     }
 
-    pub(crate) fn is_empty(&self) -> bool {
+    /// The idle grace ran out: generator results go, and generated specs
+    /// stay while they fit [`IDLE_SPEC_CACHE_BYTES`].
+    pub(crate) fn release_idle(&self) {
+        self.suggestion_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+        self.script_output_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .clear();
+        let mut specs = self.spec_cache.lock().unwrap_or_else(|err| err.into_inner());
+        if specs.allocated_bytes > IDLE_SPEC_CACHE_BYTES {
+            specs.clear();
+        }
+    }
+
+    /// Whether anything here waits on the idle grace. Generated specs that
+    /// [`Self::release_idle`] keeps never own a deadline, so a quiet engine
+    /// holding only those is not woken.
+    pub(crate) fn has_idle_results(&self) -> bool {
         let suggestions_empty = self
             .suggestion_cache
             .lock()
@@ -226,13 +252,13 @@ impl HookCache {
             .unwrap_or_else(|err| err.into_inner())
             .entries
             .is_empty();
-        let specs_empty = self
+        let specs_retire = self
             .spec_cache
             .lock()
             .unwrap_or_else(|err| err.into_inner())
-            .entries
-            .is_empty();
-        suggestions_empty && scripts_empty && specs_empty
+            .allocated_bytes
+            > IDLE_SPEC_CACHE_BYTES;
+        !(suggestions_empty && scripts_empty) || specs_retire
     }
 
     /// Take each map's snapshot under its own lock, without nesting locks or
@@ -697,7 +723,7 @@ mod tests {
         })
         .unwrap();
         assert_eq!(spec.description.len(), MAX_CACHE_BYTES);
-        assert!(cache.is_empty());
+        assert!(!cache.has_idle_results());
         assert_eq!(cache.allocated_bytes(), 0);
     }
 

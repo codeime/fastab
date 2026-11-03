@@ -554,7 +554,7 @@ impl Engine {
                 .hook_cache_idle_since
                 .is_some_and(|since| now.saturating_duration_since(since) >= grace)
         {
-            self.hook_cache.clear();
+            self.hook_cache.release_idle();
             self.hook_cache_idle_since = None;
         }
         if !self.hook_cache_active
@@ -569,7 +569,7 @@ impl Engine {
 
     /// Earliest resource deadline, including hooks when no spec remains cached.
     pub(crate) fn next_idle_deadline(&self, grace: std::time::Duration) -> Option<std::time::Instant> {
-        let hook_deadline = (!self.hook_cache_active && !self.hook_cache.is_empty())
+        let hook_deadline = (!self.hook_cache_active && self.hook_cache.has_idle_results())
             .then_some(self.hook_cache_idle_since)
             .flatten()
             .and_then(|since| since.checked_add(grace));
@@ -591,7 +591,9 @@ impl Engine {
     }
 
     fn note_idle_hook_cache(&mut self, was_empty: bool, now: std::time::Instant) {
-        if !self.hook_cache_active && !self.hook_cache.is_empty() && (was_empty || self.hook_cache_idle_since.is_none())
+        if !self.hook_cache_active
+            && self.hook_cache.has_idle_results()
+            && (was_empty || self.hook_cache_idle_since.is_none())
         {
             self.hook_cache_idle_since = Some(now);
         }
@@ -761,7 +763,7 @@ impl Engine {
             .map(|snapshot| snapshot.release_captured_after_request());
         crate::cancellation::check()?;
         let idle = self.registry.checkpoint_idle();
-        let hook_cache_was_empty = self.hook_cache.is_empty();
+        let hook_cache_was_empty = !self.hook_cache.has_idle_results();
         let history_indexes_were_empty = !self.history.has_derived_indexes();
         let history_only = request.history_only;
         crate::generate::take_pending_generators();
@@ -1013,17 +1015,21 @@ mod tests {
         engine.end_input();
         assert_eq!(engine.next_idle_deadline(grace), Some(deadline));
         engine.release_idle_specs(deadline - Duration::from_millis(1), grace);
-        assert!(!engine.hook_cache.is_empty());
+        assert!(engine.hook_cache.has_idle_results());
         engine.release_idle_specs(deadline, grace);
-        assert!(engine.hook_cache.is_empty());
+        assert!(!engine.hook_cache.has_idle_results());
         assert!(engine.next_idle_deadline(grace).is_none());
         for stats in [
             engine.diagnostics().hooks.suggestions,
             engine.diagnostics().hooks.script_output,
-            engine.diagnostics().hooks.specs,
         ] {
             assert_eq!((stats.entries, stats.allocated_bytes, stats.misses), (0, 0, 1));
         }
+        // Fig kept generated specs for the session. The small one stays,
+        // and holding it schedules no wake-up (asserted just above).
+        let specs = engine.diagnostics().hooks.specs;
+        assert_eq!((specs.entries, specs.misses), (1, 1));
+        assert!(specs.allocated_bytes > 0);
     }
 
     #[test]
@@ -1034,7 +1040,7 @@ mod tests {
         engine.release_idle_specs(now, Duration::ZERO);
         let grace = Duration::from_secs(10);
         engine.hook_cache_idle_since = Some(now - Duration::from_secs(100));
-        let was_empty = engine.hook_cache.is_empty();
+        let was_empty = !engine.hook_cache.has_idle_results();
         populate_hook_results(&engine);
         // This is the same settlement used by history-only, failed and
         // cancelled attempts: an earlier empty cache has no old owner/deadline.
@@ -1237,7 +1243,7 @@ mod tests {
         }
         let grace = Duration::from_secs(10);
         assert_eq!(engine.diagnostics().registry.cached_file_count, 0);
-        assert!(engine.hook_cache.is_empty());
+        assert!(!engine.hook_cache.has_idle_results());
         assert!(engine.diagnostics().hook_catalog.loaded);
         assert!(engine.next_idle_deadline(grace).is_none());
         engine.end_input();

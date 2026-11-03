@@ -1515,12 +1515,11 @@ impl Registry {
         let Some(path) = self.files.get(name).cloned() else {
             return;
         };
-        let files = self.files.clone();
         let loaded = if let Some(snapshot) = self.snapshot.as_ref() {
-            load_snapshot_file(snapshot, &path, &files, &mut Vec::new())
+            load_snapshot_file(snapshot, &path, &self.files, &mut Vec::new())
         } else {
             let root = self.root.clone();
-            load_spec_file(&path, &root, &files, &mut Vec::new())
+            load_spec_file(&path, &root, &self.files, &mut Vec::new())
         };
         match loaded {
             Ok(mut spec) => {
@@ -1639,13 +1638,12 @@ impl Registry {
             }
         }
 
-        let files = self.files.clone();
         let loaded = if let Some(snapshot) = self.snapshot.as_ref() {
             if !snapshot.is_file(&relative_path) {
                 tracing::warn!(path = %relative_path.display(), "loadSpec target missing");
                 return None;
             }
-            load_snapshot_file(snapshot, &relative_path, &files, &mut Vec::new())
+            load_snapshot_file(snapshot, &relative_path, &self.files, &mut Vec::new())
         } else {
             let Some(path) = relative_path
                 .to_str()
@@ -1654,7 +1652,7 @@ impl Registry {
                 tracing::warn!(path = %relative_path.display(), "loadSpec target missing");
                 return None;
             };
-            load_spec_file(&path, &self.root, &files, &mut Vec::new())
+            load_spec_file(&path, &self.root, &self.files, &mut Vec::new())
         };
         match loaded {
             Ok(mut spec) => {
@@ -1705,16 +1703,15 @@ impl Registry {
             self.note_idle_touch_path(&relative_path);
             return Some(spec);
         }
-        let files = self.files.clone();
         let loaded = if let Some(snapshot) = self.snapshot.as_ref() {
             if !snapshot.is_file(&relative_path) {
                 tracing::warn!(command = %name, path = %relative, "versioned spec missing from snapshot");
                 return None;
             }
-            load_snapshot_file(snapshot, &relative_path, &files, &mut Vec::new())
+            load_snapshot_file(snapshot, &relative_path, &self.files, &mut Vec::new())
         } else {
             let path = safe_index_path(&self.root, relative)?;
-            load_spec_file(&path, &self.root, &files, &mut Vec::new())
+            load_spec_file(&path, &self.root, &self.files, &mut Vec::new())
         };
         match loaded {
             Ok(mut spec) => {
@@ -1912,7 +1909,11 @@ impl Registry {
 /// Load a standalone JSON spec without indexing a directory.
 pub fn load_standalone_spec(path: &Path) -> Option<Spec> {
     let root = path.parent().unwrap_or(path);
-    load_spec_file(path, root, &HashMap::new(), &mut Vec::new()).ok()
+    let mut spec = load_spec_file(path, root, &HashMap::new(), &mut Vec::new()).ok()?;
+    // Registry loads share options through its pool; a standalone spec has
+    // no pool, so share them within the file.
+    intern_spec_options_local(&mut spec);
+    Some(spec)
 }
 
 /// `?` shortcuts: walk from `cwd` toward `/` for `.fig/autocomplete/build/{name}.json`.
@@ -2238,8 +2239,10 @@ fn load_spec_file_inner(
     stack.push(path.to_path_buf());
     resolve_spec_references(&mut spec, root, files, stack);
     stack.pop();
+    // No option interning here: every registry caller interns the tree into
+    // its shared pool next, which also shares identical options inside the
+    // file. A local pass first serialized every option a second time.
     spec.shrink_to_fit();
-    intern_spec_options_local(&mut spec);
     Ok(spec)
 }
 
@@ -2428,8 +2431,8 @@ fn load_snapshot_file_inner(
             path.display()
         );
     }
+    // Interned by the caller into the registry pool, as in `load_spec_file_inner`.
     spec.shrink_to_fit();
-    intern_spec_options_local(&mut spec);
     Ok(spec)
 }
 
