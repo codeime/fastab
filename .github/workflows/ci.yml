@@ -215,8 +215,18 @@ jobs:
           test -d "$swap_root/exclusive-collision"
           test -d "$swap_root/exclusive-existing"
 
+      # Job logs need a GitHub login; a failure also posts the lints as an
+      # annotation, which the public API serves (as for fterm footprint).
       - name: Clippy
-        run: cargo clippy --locked --workspace --features fastab_cli/engine-cli --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 --color always -- -D warnings
+        run: |
+          set -o pipefail
+          mkdir -p target
+          if cargo clippy --locked --workspace --features fastab_cli/engine-cli --exclude fastab_desktop-fuzz --exclude fastab_overlay_spike --exclude fastab_term2 --color never -- -D warnings 2>&1 | tee target/clippy.log; then
+            exit 0
+          fi
+          body="$(grep -E -A10 '^(error|warning)' target/clippy.log | head -200 | awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }')"
+          echo "::error title=clippy::${body}"
+          exit 1
 
       # The engine's typed-hook provenance tests verify the checked-in
       # reference baselines against the compiled bundle/specs-ir pair, which is

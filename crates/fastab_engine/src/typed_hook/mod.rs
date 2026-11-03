@@ -902,6 +902,9 @@ pub(crate) struct TypedHookCatalogIndex {
     adapter_count: usize,
 }
 
+/// A block's hook members and adapter members, as byte ranges.
+type BlockRanges = (Option<Range<usize>>, Option<Range<usize>>);
+
 #[derive(Debug)]
 struct TypedHookBlock {
     command: Box<str>,
@@ -937,7 +940,7 @@ impl TypedHookCatalogIndex {
     }
 
     /// Byte ranges of the block's hook members and adapter members.
-    pub(crate) fn ranges(&self, position: usize) -> (Option<Range<usize>>, Option<Range<usize>>) {
+    pub(crate) fn ranges(&self, position: usize) -> BlockRanges {
         let block = &self.blocks[position];
         (block.hooks.clone(), block.adapters.clone())
     }
@@ -976,7 +979,7 @@ pub(crate) fn index_typed_hook_catalog_bytes(bytes: &[u8]) -> TypedHookResult<Ty
             "typed hook {id:?} cannot be both a typed descriptor and an adapter binding"
         )));
     }
-    let mut blocks: BTreeMap<&str, (Option<Range<usize>>, Option<Range<usize>>)> = BTreeMap::new();
+    let mut blocks: BTreeMap<&str, BlockRanges> = BTreeMap::new();
     for (command, range) in member_runs(bytes, &outline.hooks)? {
         if blocks.entry(command).or_default().0.replace(range).is_some() {
             return Err(TypedHookError::new(format!(
