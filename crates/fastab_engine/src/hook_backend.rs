@@ -136,8 +136,7 @@ impl CatalogView {
 }
 
 /// The generation's block index over `typed-hooks.json`, if it has one. The
-/// first build still consumes the bytes captured while the snapshot hashed
-/// the tree; it reads the file again through a descriptor it keeps.
+/// build reads the file again through a descriptor it keeps.
 #[cfg(unix)]
 fn indexed_sidecar(snapshot: &DirectorySnapshot) -> Option<Arc<IndexedSidecar>> {
     let path = Path::new(TYPED_HOOKS_FILE);
@@ -145,8 +144,11 @@ fn indexed_sidecar(snapshot: &DirectorySnapshot) -> Option<Arc<IndexedSidecar>> 
         return None;
     }
     snapshot.sidecar_index(|| {
-        drop(snapshot.take_captured_file(path));
+        // A failed pin (the canonical directory already holds another
+        // generation) keeps the bytes captured when this one opened: the
+        // whole-file fallback still answers from them, as it always did.
         let (file, bytes) = snapshot.pin_file(path).ok()?;
+        drop(snapshot.take_captured_file(path));
         match index_typed_hook_catalog_bytes(&bytes) {
             Ok(index) => Some(IndexedSidecar { file, index }),
             Err(error) => {
