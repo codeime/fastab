@@ -130,7 +130,7 @@ jobs:
   binary-size:
     name: Binary size
     if: github.event_name != 'pull_request'
-    runs-on: macos-15
+    runs-on: macos-26
     timeout-minutes: 60
     continue-on-error: true
     steps:
@@ -159,7 +159,9 @@ jobs:
 
   rust:
     name: Rust
-    runs-on: macos-15
+    # Same image as release.yml. From 2026-11-02 macos-15 arm64 jobs sat in
+    # the queue until GitHub cancelled them unstarted, five runs in a row.
+    runs-on: macos-26
     timeout-minutes: 45
     steps:
       - uses: actions/checkout@v7
