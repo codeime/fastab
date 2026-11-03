@@ -473,6 +473,7 @@ impl Engine {
             custom_command: None,
             all_shells: false,
             current_shell: rank::HistoryShell::Unknown,
+            files: crate::shell_history::HistoryFiles::default(),
         });
         Ok(engine)
     }
@@ -729,6 +730,7 @@ impl Engine {
             all_shells,
             request.current_shell.as_deref(),
             request.current_process.as_deref(),
+            &request.environment_variables,
         );
         if self.frecency_loaded && self.history_source.as_ref() == Some(&source) {
             return;

@@ -25,6 +25,7 @@ mod public_ai;
 mod query;
 mod rank;
 mod runtime;
+mod shell_history;
 mod snapshot;
 mod spec_pair;
 mod typed_hook;

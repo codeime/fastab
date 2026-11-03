@@ -6,10 +6,14 @@
 //! after input ends, so the first keystroke of most commands rebuilds them.
 //! This replays that with a short grace and prints medians in ms, then splits
 //! a cold spec load and a cold catalog load into their steps. Generator rows
-//! run real commands in the current directory.
+//! run real commands in the current directory. Requests come from zsh with
+//! HOME on a scratch directory holding a 10,000-command `.zsh_history`, so
+//! the first one also loads shell history the way the desktop does.
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, ensure};
@@ -22,6 +26,7 @@ const ROUNDS: usize = 7;
 const BUFFERS: &[&str] = &["git che", "git checkout ", "npm run ", "docker run -", "cargo b"];
 const SPECS: &[&str] = &["git", "docker", "npm", "kubectl", "cargo"];
 const SESSION: SessionId = SessionId::new(1);
+const HISTORY_COMMANDS: usize = 10_000;
 
 fn main() -> anyhow::Result<()> {
     let specs = std::env::args()
@@ -29,6 +34,9 @@ fn main() -> anyhow::Result<()> {
         .map_or_else(|| PathBuf::from("bundle/specs-ir"), PathBuf::from);
     ensure!(specs.join("index.json").is_file(), "no spec IR at {}", specs.display());
     let cwd = std::env::current_dir()?.display().to_string();
+    let home = tempfile::tempdir()?;
+    let history_bytes = write_zsh_history(home.path())?;
+    let environment = Arc::new(vec![("HOME".to_string(), home.path().display().to_string())]);
     let started = Instant::now();
     let client = EngineClient::spawn_with_options(specs.clone(), EngineClientOptions { spec_idle_grace: GRACE })?;
     let complete = |buffer: &str| -> anyhow::Result<Duration> {
@@ -36,6 +44,8 @@ fn main() -> anyhow::Result<()> {
             buffer: buffer.into(),
             cwd: cwd.clone(),
             include_history: false,
+            current_shell: Some("/bin/zsh".into()),
+            environment_variables: Arc::clone(&environment),
             ..CompleteRequest::default()
         };
         let started = Instant::now();
@@ -44,16 +54,40 @@ fn main() -> anyhow::Result<()> {
         Ok(started.elapsed())
     };
     let spawned = started.elapsed();
-    // The first request builds the engine; an unknown command loads no spec
-    // and runs no hook, so it times that build alone.
+    // The first request builds the engine and loads history; an unknown
+    // command loads no spec and runs no hook, so it times those alone.
     let engine = complete("fastab-cold-load-unknown ")?;
     let git = complete("git ")?;
     println!(
-        "first request {:.1}: client spawn {:.1}, engine build {:.1}, then `git ` {:.1}",
+        "first request {:.1}: client spawn {:.1}, engine build + zsh history ({HISTORY_COMMANDS} commands, {} KB) {:.1}, then `git ` {:.1}",
         ms(started.elapsed()),
         ms(spawned),
+        history_bytes / 1024,
         ms(engine),
         ms(git)
+    );
+    // What the first request used to spend on history: a login zsh, which
+    // sources the profile but not /etc/zshrc, so it has no HISTFILE.
+    let started = Instant::now();
+    let old = std::process::Command::new("zsh")
+        .args(["-lc", "fc -R; fc -ln -10000"])
+        .current_dir("/")
+        .output();
+    println!(
+        "former history source `zsh -lc 'fc -R; fc -ln -10000'`: {:.1} ({})",
+        ms(started.elapsed()),
+        old.map_or_else(
+            |error| format!("failed: {error}"),
+            |output| format!(
+                "exit {:?}, {} lines",
+                output.status.code(),
+                output
+                    .stdout
+                    .split(|&byte| byte == b'\n')
+                    .filter(|line| !line.is_empty())
+                    .count()
+            )
+        )
     );
     for buffer in BUFFERS {
         let mut idle = Vec::with_capacity(ROUNDS);
@@ -163,6 +197,24 @@ fn catalog_phases(specs: &Path) -> anyhow::Result<String> {
         ms(owned_parse),
         ms(borrowed_scan)
     ))
+}
+
+/// An EXTENDED_HISTORY file shaped like a working developer's.
+fn write_zsh_history(home: &Path) -> anyhow::Result<usize> {
+    let mut history = String::new();
+    for i in 0..HISTORY_COMMANDS {
+        let command = match i % 6 {
+            0 => format!("git checkout feature/branch-{}", i % 97),
+            1 => "git status".to_string(),
+            2 => format!("cargo test -p crate_{} -- --nocapture", i % 23),
+            3 => format!("cd ~/src/project-{}", i % 41),
+            4 => format!("docker run -it --rm -v $PWD:/work image-{}:latest bash", i % 13),
+            _ => format!("npm run build -- --filter=pkg-{}", i % 17),
+        };
+        writeln!(history, ": {}:0;{command}", 1_700_000_000 + i)?;
+    }
+    std::fs::write(home.join(".zsh_history"), &history)?;
+    Ok(history.len())
 }
 
 fn timed<T>(f: impl FnOnce() -> T) -> (T, Duration) {

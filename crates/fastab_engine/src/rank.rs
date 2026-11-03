@@ -182,12 +182,13 @@ pub(crate) enum HistoryShell {
 
 /// Inputs which affect the history source.  Runtime keeps one of these beside
 /// the frecency cache so changing settings or switching terminals reloads the
-/// source once, rather than spawning a command for every keystroke.
+/// source once, rather than reading it for every keystroke.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HistorySourceConfig {
     pub custom_command: Option<String>,
     pub all_shells: bool,
     pub current_shell: HistoryShell,
+    pub files: crate::shell_history::HistoryFiles,
 }
 
 pub(crate) fn history_source_config(
@@ -195,6 +196,7 @@ pub(crate) fn history_source_config(
     all_shells: bool,
     current_shell: Option<&str>,
     current_process: Option<&str>,
+    environment: &[(String, String)],
 ) -> HistorySourceConfig {
     let shell = normalize_history_shell(current_shell);
     let current_shell = if shell != HistoryShell::Unknown {
@@ -202,10 +204,16 @@ pub(crate) fn history_source_config(
     } else {
         normalize_history_shell(current_process)
     };
+    let files = if custom_command.is_some() {
+        crate::shell_history::HistoryFiles::default()
+    } else {
+        crate::shell_history::HistoryFiles::resolve(current_shell, all_shells, environment)
+    };
     HistorySourceConfig {
         custom_command,
         all_shells,
         current_shell,
+        files,
     }
 }
 
@@ -1111,6 +1119,7 @@ pub fn load_commands() -> Vec<(String, u64)> {
         custom_command: None,
         all_shells: true,
         current_shell: HistoryShell::Unknown,
+        files: crate::shell_history::HistoryFiles::default(),
     })
 }
 
@@ -1120,8 +1129,9 @@ pub fn load_commands() -> Vec<(String, u64)> {
 /// the old WebView implementation. Its output wins when it is non-empty; a
 /// failure, timeout, or empty output falls back to the local history
 /// database, both capped at the recent window. Without a custom command,
-/// known shells are filtered to the current shell (or zsh+bash when
-/// `allShells` is enabled); unknown shells use the database source.
+/// known shells read their own history files (the current shell's, or
+/// zsh+bash when `allShells` is enabled) and fall back to the database rows
+/// of those shells; unknown shells use the database source.
 pub(crate) fn load_commands_for(config: &HistorySourceConfig) -> Vec<(String, u64)> {
     if let Some(command) = config.custom_command.as_deref() {
         if let Some(commands) = run_custom_history(command) {
@@ -1131,18 +1141,20 @@ pub(crate) fn load_commands_for(config: &HistorySourceConfig) -> Vec<(String, u6
     }
 
     let mut from_shell = Vec::new();
+    let mut read = |shell| {
+        let commands = crate::shell_history::commands(&config.files, shell, MAX_DATABASE_HISTORY_COMMANDS);
+        from_shell.extend(commands.into_iter().map(|command| (command, 0)));
+    };
     match config.current_shell {
-        HistoryShell::Zsh | HistoryShell::Bash | HistoryShell::Fish => {
-            from_shell.extend(login_history_commands(config.current_shell));
-        },
+        HistoryShell::Zsh | HistoryShell::Bash | HistoryShell::Fish => read(config.current_shell),
         HistoryShell::Unknown => {},
     }
     if config.all_shells {
         if config.current_shell != HistoryShell::Zsh {
-            from_shell.extend(login_history_commands(HistoryShell::Zsh));
+            read(HistoryShell::Zsh);
         }
         if config.current_shell != HistoryShell::Bash {
-            from_shell.extend(login_history_commands(HistoryShell::Bash));
+            read(HistoryShell::Bash);
         }
     }
     if from_shell.is_empty() {
@@ -1153,35 +1165,6 @@ pub(crate) fn load_commands_for(config: &HistorySourceConfig) -> Vec<(String, u6
     } else {
         from_shell
     }
-}
-
-fn recent_shell_history_command(shell: HistoryShell) -> String {
-    match shell {
-        // `fc` lists oldest-first. A negative start is an offset from the
-        // current event, so this is the recent window only.
-        HistoryShell::Zsh => format!("fc -R; fc -ln -{MAX_DATABASE_HISTORY_COMMANDS}"),
-        HistoryShell::Bash => format!("fc -ln -{MAX_DATABASE_HISTORY_COMMANDS}"),
-        // fish lists newest-first. `--max` keeps that head; the parser then
-        // flips it to oldest-first so it matches `fc`.
-        HistoryShell::Fish => format!("history search --max={MAX_DATABASE_HISTORY_COMMANDS}"),
-        HistoryShell::Unknown => String::new(),
-    }
-}
-
-fn login_history_commands(shell: HistoryShell) -> Vec<(String, u64)> {
-    let command = recent_shell_history_command(shell);
-    if command.is_empty() {
-        return Vec::new();
-    }
-    let shell_name = match shell {
-        HistoryShell::Zsh => "zsh",
-        HistoryShell::Bash => "bash",
-        HistoryShell::Fish => "fish",
-        HistoryShell::Unknown => return Vec::new(),
-    };
-    crate::process::try_execute_isolated_success(shell_name, &["-lc".into(), command], "", CUSTOM_HISTORY_TIMEOUT)
-        .map(|output| history_commands_from_output_limited(&output, shell == HistoryShell::Fish))
-        .unwrap_or_default()
 }
 
 fn includes_database_shell(config: &HistorySourceConfig, row_shell: HistoryShell) -> bool {
@@ -1199,28 +1182,15 @@ fn non_empty_history_command(command: &str) -> Option<String> {
 }
 
 fn history_commands_from_output(output: &str) -> Vec<(String, u64)> {
-    // Custom commands and `fc` are oldest-first, so the recent window is the tail.
-    history_commands_from_output_limited(output, false)
-}
-
-fn history_commands_from_output_limited(output: &str, newest_first: bool) -> Vec<(String, u64)> {
     let mut commands: Vec<(String, u64)> = output
         .lines()
         .filter_map(non_empty_history_command)
         .map(|command| (command, 0))
         .collect();
+    // Custom commands list oldest-first, so the recent window is the tail.
     if commands.len() > MAX_DATABASE_HISTORY_COMMANDS {
-        if newest_first {
-            commands.truncate(MAX_DATABASE_HISTORY_COMMANDS);
-        } else {
-            let start = commands.len() - MAX_DATABASE_HISTORY_COMMANDS;
-            commands = commands.split_off(start);
-        }
-    }
-    // `history_suggestions` walks this list backwards. Fish emits newest-first,
-    // so flip that window; `fc` is already oldest-first.
-    if newest_first {
-        commands.reverse();
+        let start = commands.len() - MAX_DATABASE_HISTORY_COMMANDS;
+        commands = commands.split_off(start);
     }
     commands
 }
@@ -2084,12 +2054,12 @@ mod tests {
 
     #[test]
     fn history_source_key_changes_only_with_source_inputs() {
-        let zsh = history_source_config(None, false, Some("/bin/zsh"), None);
-        let zsh_again = history_source_config(None, false, Some("zsh"), Some("bash"));
-        let zsh_from_process = history_source_config(None, false, Some("unknown"), Some("/bin/zsh"));
-        let bash = history_source_config(None, false, Some("bash"), None);
-        let all_shells = history_source_config(None, true, Some("zsh"), None);
-        let custom = history_source_config(Some("fc -ln 1".into()), false, Some("zsh"), None);
+        let zsh = history_source_config(None, false, Some("/bin/zsh"), None, &[]);
+        let zsh_again = history_source_config(None, false, Some("zsh"), Some("bash"), &[]);
+        let zsh_from_process = history_source_config(None, false, Some("unknown"), Some("/bin/zsh"), &[]);
+        let bash = history_source_config(None, false, Some("bash"), None, &[]);
+        let all_shells = history_source_config(None, true, Some("zsh"), None, &[]);
+        let custom = history_source_config(Some("fc -ln 1".into()), false, Some("zsh"), None, &[]);
 
         assert_eq!(zsh, zsh_again);
         assert_eq!(zsh, zsh_from_process);
@@ -2118,43 +2088,45 @@ mod tests {
         assert_eq!(parsed.len(), MAX_DATABASE_HISTORY_COMMANDS);
         assert_eq!(parsed[0].0, "cmd3");
         assert_eq!(parsed.last().unwrap().0, format!("cmd{}", total - 1));
-
-        let mut newest_first = String::new();
-        for i in (0..total).rev() {
-            newest_first.push_str(&format!("cmd{i}\n"));
-        }
-        let parsed = history_commands_from_output_limited(&newest_first, true);
-        assert_eq!(parsed.len(), MAX_DATABASE_HISTORY_COMMANDS);
-        assert_eq!(parsed[0].0, "cmd3");
-        assert_eq!(parsed.last().unwrap().0, format!("cmd{}", total - 1));
     }
 
     #[test]
-    fn shell_history_commands_request_only_the_recent_window() {
-        let limit = MAX_DATABASE_HISTORY_COMMANDS.to_string();
-        assert!(recent_shell_history_command(HistoryShell::Zsh).contains(&limit));
-        assert!(recent_shell_history_command(HistoryShell::Bash).contains(&limit));
-        assert!(recent_shell_history_command(HistoryShell::Fish).contains(&limit));
-        assert!(!recent_shell_history_command(HistoryShell::Zsh).contains("fc -ln 1"));
+    fn shell_history_comes_from_the_shells_own_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".zsh_history"), ": 1:0;git status\n: 2:0;cargo build\n").unwrap();
+        std::fs::write(dir.path().join(".bash_history"), "ls\n").unwrap();
+        let env = vec![("HOME".to_string(), dir.path().display().to_string())];
+
+        let zsh = history_source_config(None, false, Some("zsh"), None, &env);
+        assert_eq!(
+            load_commands_for(&zsh),
+            vec![("git status".to_string(), 0), ("cargo build".to_string(), 0)]
+        );
+        let merged = history_source_config(None, true, Some("bash"), None, &env);
+        let merged: Vec<_> = load_commands_for(&merged)
+            .into_iter()
+            .map(|(command, _)| command)
+            .collect();
+        assert_eq!(merged, vec!["ls", "git status", "cargo build"]);
     }
 
     #[test]
     fn history_shell_selection_matches_legacy_sources() {
-        let zsh = history_source_config(None, false, Some("zsh"), None);
+        let zsh = history_source_config(None, false, Some("zsh"), None, &[]);
         assert!(includes_database_shell(&zsh, HistoryShell::Zsh));
         assert!(!includes_database_shell(&zsh, HistoryShell::Bash));
         assert!(!includes_database_shell(&zsh, HistoryShell::Fish));
 
-        let merged = history_source_config(None, true, Some("/bin/bash"), None);
+        let merged = history_source_config(None, true, Some("/bin/bash"), None, &[]);
         assert!(includes_database_shell(&merged, HistoryShell::Zsh));
         assert!(includes_database_shell(&merged, HistoryShell::Bash));
         assert!(!includes_database_shell(&merged, HistoryShell::Fish));
 
-        let fish = history_source_config(None, true, Some("fish"), None);
+        let fish = history_source_config(None, true, Some("fish"), None, &[]);
         assert!(includes_database_shell(&fish, HistoryShell::Fish));
         assert!(!includes_database_shell(&fish, HistoryShell::Zsh));
 
-        let unknown = history_source_config(None, false, Some("nu"), None);
+        let unknown = history_source_config(None, false, Some("nu"), None, &[]);
         assert!(includes_database_shell(&unknown, HistoryShell::Zsh));
         assert!(includes_database_shell(&unknown, HistoryShell::Bash));
         assert!(includes_database_shell(&unknown, HistoryShell::Fish));
