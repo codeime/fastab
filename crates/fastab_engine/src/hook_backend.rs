@@ -191,6 +191,11 @@ fn hooks_skipped() -> bool {
     SKIP_HOOKS.get() || crate::cancellation::is_cancelled()
 }
 
+/// Inside [`without_hooks`]: no hook runs, and no cached hook result applies.
+pub(crate) fn hooks_suspended() -> bool {
+    SKIP_HOOKS.get()
+}
+
 fn native() -> Option<Arc<NativeHooks>> {
     NATIVE.with(|cell| cell.borrow().clone())
 }

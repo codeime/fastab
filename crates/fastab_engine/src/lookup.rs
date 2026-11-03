@@ -907,7 +907,7 @@ fn walk_spec(
     mut trace: Option<&mut crate::history::WalkTrace>,
 ) -> WalkedSpec {
     let mut current = root;
-    apply_generate_spec(&mut current, tokens);
+    apply_generate_spec(&mut current, tokens, limit);
     let mut parent = current.clone();
     let mut index = 1;
     let mut path_end = 1usize;
@@ -979,6 +979,7 @@ fn walk_spec(
                                 next,
                                 index,
                                 tokens,
+                                limit,
                                 restart_parser,
                                 &mut after_double_dash,
                             );
@@ -1024,6 +1025,7 @@ fn walk_spec(
                                 next,
                                 index,
                                 tokens,
+                                limit,
                                 restart_parser,
                                 &mut after_double_dash,
                             );
@@ -1090,7 +1092,7 @@ fn walk_spec(
                     }
                 }
                 current = entered;
-                apply_generate_spec(&mut current, tokens);
+                apply_generate_spec(&mut current, tokens, limit);
                 apply_js_load_spec(&mut current, token);
                 index += 1;
                 path_end = index;
@@ -1153,6 +1155,7 @@ fn walk_spec(
                     next,
                     index,
                     tokens,
+                    limit,
                     restart_parser,
                     &mut after_double_dash,
                 );
@@ -1231,26 +1234,42 @@ fn apply_js_load_spec(current: &mut Arc<Spec>, token: &str) {
     *current = Arc::new(crate::hook_backend::merge_generated_spec(current.as_ref(), loaded));
 }
 
-fn apply_generate_spec(current: &mut Arc<Spec>, tokens: &[String]) {
+/// `limit` is the walker's count of finished tokens; the rest is being typed.
+fn apply_generate_spec(current: &mut Arc<Spec>, tokens: &[String], limit: usize) {
     let Some(hook_id) = current.js_generate_spec.clone() else {
         return;
     };
+    // History parsing skips hooks, and must not pick up a cached result either.
+    if crate::hook_backend::hooks_suspended() {
+        return;
+    }
     let Some(cwd) = crate::hook_backend::current_cwd() else {
         return;
     };
     let timeout = dynamic_hook_timeout();
-    let generated = if let Some(key) = current.generate_spec_cache_key.as_deref() {
-        let cache_key = format!("{}:{key}", tokens.first().cloned().unwrap_or_default());
-        cached_generated_spec(&cache_key, || {
-            crate::hook_backend::dispatch_generate_spec(&hook_id, tokens, &cwd, timeout)
-        })
-    } else {
+    let cache_key = generate_spec_cache_key(current, &hook_id, tokens, limit, &cwd);
+    let generated = cached_generated_spec(&cache_key, || {
         crate::hook_backend::dispatch_generate_spec(&hook_id, tokens, &cwd, timeout)
-    };
+    });
     let Some(generated) = generated else {
         return;
     };
     *current = Arc::new(crate::hook_backend::merge_generated_spec(current.as_ref(), generated));
+}
+
+/// A spec's `generateSpecCacheKey`, prefixed with the command as Fig did.
+/// Without one, Fig still ran `generateSpec` once per command prefix: it
+/// cached the whole parse by the finished tokens, the spec, the cwd and the
+/// shell process (`parseArgumentsCached`), so typing `git che` ran
+/// `git help -a` once, not once per keystroke.
+fn generate_spec_cache_key(current: &Spec, hook_id: &str, tokens: &[String], limit: usize, cwd: &str) -> String {
+    let command = tokens.first().map_or("", String::as_str);
+    if let Some(key) = current.generate_spec_cache_key.as_deref() {
+        return format!("{command}:{key}");
+    }
+    let finished = tokens[..limit.min(tokens.len())].join("\x1f");
+    let process = crate::hook_backend::current_shell().current_process;
+    format!("\x1fparse\x1f{hook_id}\x1f{finished}\x1f{cwd}\x1f{process}")
 }
 
 fn cached_generated_spec(cache_key: &str, run: impl FnOnce() -> Option<Spec>) -> Option<Spec> {
@@ -1289,12 +1308,13 @@ fn enter_loaded_spec(
     next: Arc<Spec>,
     index: usize,
     tokens: &[String],
+    limit: usize,
     restart_parser: bool,
     after_double_dash: &mut bool,
 ) {
     *parent = current.clone();
     *current = next;
-    apply_generate_spec(current, tokens);
+    apply_generate_spec(current, tokens, limit);
     if let Some(token) = tokens.get(index.saturating_sub(1)) {
         apply_js_load_spec(current, token);
     }
@@ -3415,6 +3435,88 @@ mod tests {
         let stub = gcloud.find_subcommand("compute").expect("stub");
         assert!(!stub.meta.ai_resolved_reference);
         assert!(matches!(stub.load_spec, Some(crate::ir::LoadSpec::Path(ref path)) if path == "gcloud/compute"));
+    }
+
+    #[test]
+    fn generate_spec_runs_once_per_finished_command_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let (hook_id, hook_entry) = crate::hook_backend::test_typed_entry(
+            "tool#generate#0",
+            "generateSpec",
+            serde_json::json!({
+                "op": "seq",
+                "items": [
+                    {
+                        "op": "exec",
+                        "command": {"op": "string", "value": "tool"},
+                        "args": {"op": "array", "items": [{"op": "string", "value": "--list"}]},
+                        "cwd": {"op": "null"},
+                        "env": {"op": "null"},
+                        "timeout": {"op": "null"}
+                    },
+                    {
+                        "op": "spec-object",
+                        "fields": [
+                            {"key": "name", "value": {"op": "string", "value": "tool"}},
+                            {"key": "subcommands", "value": {"op": "array", "items": [{
+                                "op": "spec-object",
+                                "fields": [{"key": "name", "value": {"op": "string", "value": "generated"}}]
+                            }]}}
+                        ]
+                    }
+                ]
+            }),
+        );
+        fs::write(
+            dir.path().join("tool.json"),
+            r#"{"names":["tool"],"jsGenerateSpec":"tool#generate#0","subcommands":[{"names":["static"]}]}"#,
+        )
+        .unwrap();
+        let mut registry = Registry::load(dir.path()).unwrap();
+        let native = crate::hook_backend::test_native_hooks(vec![(hook_id, hook_entry)]);
+        let _bound = crate::hook_backend::bind_native(Arc::new(native));
+        let cache = crate::hook_cache::HookCache::new();
+        let _cache = cache.bind();
+        let _guard = process::mock::install(vec![process::mock::ExecRule {
+            command: Some("tool".into()),
+            args: Some(vec!["--list".into()]),
+            ..process::mock::ExecRule::default()
+        }]);
+        let first_cwd = dir.path().display().to_string();
+        let second_cwd = dir.path().join("sub").display().to_string();
+        let request = |buffer: &str, cwd: &str| CompleteRequest {
+            buffer: buffer.into(),
+            cwd: cwd.into(),
+            include_history: false,
+            ..CompleteRequest::default()
+        };
+        let mut run = |buffer: &str, cwd: &str| {
+            let result = crate::hook_backend::enter_context(cwd, &crate::hook_types::ShellContext::default(), || {
+                complete(&mut registry, &request(buffer, cwd))
+            });
+            let names: Vec<String> = result.suggestions.into_iter().map(|row| row.name).collect();
+            (names, process::mock::calls().len())
+        };
+        // Fig answered `tool g`, `tool ge` and `tool gen` from one cached parse.
+        for buffer in ["tool g", "tool ge", "tool gen"] {
+            let (names, calls) = run(buffer, &first_cwd);
+            assert!(names.iter().any(|name| name == "generated"), "{buffer}: {names:?}");
+            assert_eq!(calls, 1, "{buffer}");
+        }
+        // A finished token, or another directory, is another parse.
+        assert_eq!(run("tool generated ", &first_cwd).1, 2);
+        assert_eq!(run("tool g", &second_cwd).1, 3);
+        // History parsing runs no hook and must not take a cached result.
+        let history =
+            crate::hook_backend::enter_context(&first_cwd, &crate::hook_types::ShellContext::default(), || {
+                crate::hook_backend::without_hooks(|| complete(&mut registry, &request("tool g", &first_cwd)))
+            });
+        assert!(
+            !history.suggestions.iter().any(|row| row.name == "generated"),
+            "{:?}",
+            history.suggestions
+        );
+        assert_eq!(process::mock::calls().len(), 3);
     }
 
     #[test]
