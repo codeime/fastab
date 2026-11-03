@@ -9,12 +9,13 @@
 //! reads identical content or fails closed and marks the snapshot stale; it
 //! can never return a different generation's bytes.
 
+use std::any::Any;
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use sha2::{Digest, Sha256};
 
@@ -48,10 +49,79 @@ struct SnapshotInner {
     captured_files: CapturedFiles,
     generation: Generation,
     stale: AtomicBool,
+    sidecar_index: SidecarIndexSlot,
 }
 
 /// One-shot bodies captured while hashing. Debug prints names only.
 struct CapturedFiles(Mutex<HashMap<PathBuf, Vec<u8>>>);
+
+/// One index over a sidecar, built on first use and kept for this
+/// generation, so owners that come and go (the engine retires its hook owner
+/// after every idle grace) do not rescan the file. `None` records a failed
+/// build: callers fall back to whole-file reads.
+#[derive(Default)]
+struct SidecarIndexSlot(OnceLock<Option<Arc<dyn Any + Send + Sync>>>);
+
+impl fmt::Debug for SidecarIndexSlot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self.0.get() {
+            None => "<unbuilt>",
+            Some(None) => "<unavailable>",
+            Some(Some(_)) => "<built>",
+        })
+    }
+}
+
+/// A file read and verified against this generation's digest, kept open for
+/// ranged reads of that same inode. A read refuses once the inode's size or
+/// change times moved, which an in-place write cannot avoid.
+#[cfg(unix)]
+pub(crate) struct PinnedFile {
+    file: File,
+    identity: FileIdentity,
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct FileIdentity {
+    inode: u64,
+    size: i64,
+    modified: (i64, i64),
+    changed: (i64, i64),
+}
+
+#[cfg(unix)]
+impl FileIdentity {
+    fn of(stat: &libc::stat) -> Self {
+        Self {
+            inode: stat.st_ino,
+            size: stat.st_size,
+            modified: (stat.st_mtime, stat.st_mtime_nsec),
+            changed: (stat.st_ctime, stat.st_ctime_nsec),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl PinnedFile {
+    /// The inode still has the size and change times it had when verified.
+    pub(crate) fn is_intact(&self) -> bool {
+        fstat_fd(self.file.as_raw_fd()).is_ok_and(|stat| FileIdentity::of(&stat) == self.identity)
+    }
+
+    pub(crate) fn read_range(&self, range: std::ops::Range<usize>) -> io::Result<Vec<u8>> {
+        use std::os::unix::fs::FileExt;
+        if !self.is_intact() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pinned sidecar changed after it was verified",
+            ));
+        }
+        let mut bytes = vec![0; range.len()];
+        self.file.read_exact_at(&mut bytes, range.start as u64)?;
+        Ok(bytes)
+    }
+}
 
 /// Release unused captured bytes on every request exit, including cancellation
 /// or unwind. The shared snapshot keeps its generation and file digests.
@@ -125,6 +195,7 @@ impl DirectorySnapshot {
                         marker_digest,
                     },
                     stale: AtomicBool::new(false),
+                    sidecar_index: SidecarIndexSlot::default(),
                 }),
             })
         }
@@ -162,6 +233,7 @@ impl DirectorySnapshot {
                         marker_digest,
                     },
                     stale: AtomicBool::new(false),
+                    sidecar_index: SidecarIndexSlot::default(),
                 }),
             })
         }
@@ -350,6 +422,60 @@ impl DirectorySnapshot {
 
     pub(crate) fn is_file(&self, relative: &Path) -> bool {
         matches!(self.kind(relative), Ok(EntryKind::File))
+    }
+
+    /// The index this generation built over a sidecar, built by `build` on
+    /// first use. Every owner of the snapshot shares it.
+    pub(crate) fn sidecar_index<T: Any + Send + Sync>(&self, build: impl FnOnce() -> Option<T>) -> Option<Arc<T>> {
+        let built = self
+            .inner
+            .sidecar_index
+            .0
+            .get_or_init(|| build().map(|index| Arc::new(index) as Arc<dyn Any + Send + Sync>));
+        Arc::clone(built.as_ref()?).downcast::<T>().ok()
+    }
+
+    /// [`Self::read_file`], keeping the descriptor for ranged reads of the
+    /// verified inode. Failures mark the snapshot stale, as reads do.
+    #[cfg(unix)]
+    pub(crate) fn pin_file(&self, relative: &Path) -> io::Result<(PinnedFile, Vec<u8>)> {
+        validate_relative_path(relative)?;
+        let Some(expected) = self.inner.file_digests.get(relative) else {
+            self.mark_stale();
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("snapshot file not found: {}", relative.display()),
+            ));
+        };
+        let pinned = self.read_pinned(relative, expected);
+        if pinned.is_err() {
+            self.mark_stale();
+        }
+        pinned
+    }
+
+    #[cfg(unix)]
+    fn read_pinned(&self, relative: &Path, expected: &str) -> io::Result<(PinnedFile, Vec<u8>)> {
+        let root_fd = open_root(&self.inner.display_path)?;
+        let fd = open_relative(root_fd.as_raw_fd(), relative)?;
+        let metadata = fstat_fd(fd.as_raw_fd())?;
+        if !is_regular_file(&metadata) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{} is not a regular file", relative.display()),
+            ));
+        }
+        let mut file = File::from(fd);
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes)?;
+        if sha256_hex(&bytes) != expected {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("snapshot digest mismatch: {}", relative.display()),
+            ));
+        }
+        let identity = FileIdentity::of(&metadata);
+        Ok((PinnedFile { file, identity }, bytes))
     }
 
     /// Iterate over the digests captured from the opened directory generation.

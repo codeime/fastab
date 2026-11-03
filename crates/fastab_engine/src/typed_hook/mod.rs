@@ -18,6 +18,7 @@ use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt;
 use std::hash::{Hash, Hasher};
+use std::ops::Range;
 use std::sync::{Arc, OnceLock};
 
 use serde::{Deserialize, Serialize};
@@ -833,26 +834,28 @@ impl TypedHookCatalog {
     /// body to a file. After index validation the worker only needs the
     /// lazy descriptor and the adapter SHA map (G2).
     pub(crate) fn into_runtime(self) -> RuntimeTypedHookCatalog {
-        RuntimeTypedHookCatalog {
-            hooks: self
-                .hooks
-                .into_iter()
-                .map(|(id, entry)| (id, entry.descriptor))
-                .collect(),
-            adapters: self
-                .adapters
-                .into_iter()
-                .map(|(id, entry)| {
-                    (
-                        id,
-                        RuntimeTypedHookAdapter {
-                            source_field: entry.source_field,
-                            function_body_sha256: entry.function_body_sha256,
-                        },
-                    )
-                })
-                .collect(),
-        }
+        runtime_catalog(self.hooks, self.adapters)
+    }
+}
+
+fn runtime_catalog(
+    hooks: BTreeMap<String, TypedHookCatalogEntry>,
+    adapters: BTreeMap<String, TypedHookAdapterBinding>,
+) -> RuntimeTypedHookCatalog {
+    RuntimeTypedHookCatalog {
+        hooks: hooks.into_iter().map(|(id, entry)| (id, entry.descriptor)).collect(),
+        adapters: adapters
+            .into_iter()
+            .map(|(id, entry)| {
+                (
+                    id,
+                    RuntimeTypedHookAdapter {
+                        source_field: entry.source_field,
+                        function_body_sha256: entry.function_body_sha256,
+                    },
+                )
+            })
+            .collect(),
     }
 }
 
@@ -884,6 +887,183 @@ impl RuntimeTypedHookCatalog {
         }
         (seen.len(), parsed)
     }
+}
+
+/// Where each command's hooks sit in `typed-hooks.json`. The compiler sorts
+/// hook ids, which read `<command>#<field>#<n>`, so a command's hooks, and its
+/// adapters, are one contiguous run of members. A dispatch then reads and
+/// parses its own command's run instead of the whole catalog, which cost
+/// ~13 ms on CI (4.6 MB) on the first hook after every idle grace.
+#[derive(Debug)]
+pub(crate) struct TypedHookCatalogIndex {
+    /// Sorted by command.
+    blocks: Vec<TypedHookBlock>,
+    hook_count: usize,
+    adapter_count: usize,
+}
+
+#[derive(Debug)]
+struct TypedHookBlock {
+    command: Box<str>,
+    /// `"id": {…}, …` members, without the enclosing braces.
+    hooks: Option<Range<usize>>,
+    adapters: Option<Range<usize>>,
+}
+
+/// The block a hook id belongs to.
+pub(crate) fn typed_hook_command(hook_id: &str) -> &str {
+    hook_id.split_once('#').map_or(hook_id, |(command, _)| command)
+}
+
+impl TypedHookCatalogIndex {
+    pub(crate) fn len(&self) -> usize {
+        self.blocks.len()
+    }
+
+    pub(crate) fn hook_count(&self) -> usize {
+        self.hook_count
+    }
+
+    pub(crate) fn adapter_count(&self) -> usize {
+        self.adapter_count
+    }
+
+    /// Position of the block that holds `hook_id`.
+    pub(crate) fn position(&self, hook_id: &str) -> Option<usize> {
+        let command = typed_hook_command(hook_id);
+        self.blocks
+            .binary_search_by(|block| block.command.as_ref().cmp(command))
+            .ok()
+    }
+
+    /// Byte ranges of the block's hook members and adapter members.
+    pub(crate) fn ranges(&self, position: usize) -> (Option<Range<usize>>, Option<Range<usize>>) {
+        let block = &self.blocks[position];
+        (block.hooks.clone(), block.adapters.clone())
+    }
+}
+
+/// Validate the header and every id, and record where each command's members
+/// sit; entries are validated when their block is parsed. An escaped key, or
+/// a command whose members are not contiguous, is an error, and the caller
+/// then parses the catalog whole.
+pub(crate) fn index_typed_hook_catalog_bytes(bytes: &[u8]) -> TypedHookResult<TypedHookCatalogIndex> {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Outline<'a> {
+        version: u64,
+        kind: String,
+        contracts: TypedHookContracts,
+        #[serde(borrow)]
+        hooks: BTreeMap<&'a str, &'a RawValue>,
+        #[serde(default, borrow)]
+        adapters: BTreeMap<&'a str, &'a RawValue>,
+    }
+    if bytes.len() > MAX_CATALOG_BYTES {
+        return Err(TypedHookError::new(format!(
+            "typed hook catalog exceeds {MAX_CATALOG_BYTES} bytes"
+        )));
+    }
+    let outline = serde_json::from_slice::<Outline<'_>>(bytes)
+        .map_err(|error| TypedHookError::new(format!("typed hook catalog schema: {error}")))?;
+    validate_catalog_header(outline.version, &outline.kind, &outline.contracts)?;
+    validate_catalog_hook_count(outline.hooks.len(), outline.adapters.len())?;
+    for id in outline.hooks.keys().chain(outline.adapters.keys()) {
+        validate_hook_id(id)?;
+    }
+    if let Some(id) = outline.adapters.keys().find(|id| outline.hooks.contains_key(*id)) {
+        return Err(TypedHookError::new(format!(
+            "typed hook {id:?} cannot be both a typed descriptor and an adapter binding"
+        )));
+    }
+    let mut blocks: BTreeMap<&str, (Option<Range<usize>>, Option<Range<usize>>)> = BTreeMap::new();
+    for (command, range) in member_runs(bytes, &outline.hooks)? {
+        if blocks.entry(command).or_default().0.replace(range).is_some() {
+            return Err(TypedHookError::new(format!(
+                "typed hooks for {command:?} are not contiguous"
+            )));
+        }
+    }
+    for (command, range) in member_runs(bytes, &outline.adapters)? {
+        if blocks.entry(command).or_default().1.replace(range).is_some() {
+            return Err(TypedHookError::new(format!(
+                "typed hook adapters for {command:?} are not contiguous"
+            )));
+        }
+    }
+    Ok(TypedHookCatalogIndex {
+        blocks: blocks
+            .into_iter()
+            .map(|(command, (hooks, adapters))| TypedHookBlock {
+                command: command.into(),
+                hooks,
+                adapters,
+            })
+            .collect(),
+        hook_count: outline.hooks.len(),
+        adapter_count: outline.adapters.len(),
+    })
+}
+
+/// One byte range per command, in file order: from the opening quote of the
+/// first member's key to the end of the last member's value.
+fn member_runs<'a>(
+    bytes: &[u8],
+    members: &BTreeMap<&'a str, &'a RawValue>,
+) -> TypedHookResult<Vec<(&'a str, Range<usize>)>> {
+    let base = bytes.as_ptr() as usize;
+    let mut spans: Vec<(usize, usize, &'a str)> = members
+        .iter()
+        .map(|(id, value)| {
+            let value = value.get();
+            let start = (id.as_ptr() as usize - base).saturating_sub(1);
+            (start, value.as_ptr() as usize - base + value.len(), *id)
+        })
+        .collect();
+    spans.sort_unstable_by_key(|(start, _, _)| *start);
+    let mut runs: Vec<(&'a str, Range<usize>)> = Vec::new();
+    for (start, end, id) in spans {
+        if bytes.get(start) != Some(&b'"') {
+            return Err(TypedHookError::new("typed hook catalog key does not start at a quote"));
+        }
+        let command = typed_hook_command(id);
+        match runs.last_mut() {
+            Some((last, range)) if *last == command => range.end = end,
+            _ => runs.push((command, start..end)),
+        }
+    }
+    Ok(runs)
+}
+
+/// Parse one command's members as cut by [`index_typed_hook_catalog_bytes`],
+/// with the per-entry checks [`parse_typed_hook_catalog_bytes`] applies.
+pub(crate) fn parse_typed_hook_block(
+    hooks: Option<&[u8]>,
+    adapters: Option<&[u8]>,
+) -> TypedHookResult<RuntimeTypedHookCatalog> {
+    let hooks: BTreeMap<String, TypedHookCatalogEntry> = match hooks {
+        Some(members) => with_descriptor_intern(|| parse_catalog_members(members))?,
+        None => BTreeMap::new(),
+    };
+    let adapters: BTreeMap<String, TypedHookAdapterBinding> = match adapters {
+        Some(members) => parse_catalog_members(members)?,
+        None => BTreeMap::new(),
+    };
+    for (id, entry) in &hooks {
+        validate_hook_entry(id, entry)?;
+    }
+    for (id, entry) in &adapters {
+        validate_adapter_entry(id, entry, hooks.contains_key(id))?;
+    }
+    Ok(runtime_catalog(hooks, adapters))
+}
+
+fn parse_catalog_members<T: serde::de::DeserializeOwned>(members: &[u8]) -> TypedHookResult<BTreeMap<String, T>> {
+    let mut object = Vec::with_capacity(members.len() + 2);
+    object.push(b'{');
+    object.extend_from_slice(members);
+    object.push(b'}');
+    serde_json::from_slice(&object).map_err(|error| TypedHookError::new(format!("typed hook catalog schema: {error}")))
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -1639,45 +1819,56 @@ fn validate_typed_hook_catalog(catalog: &TypedHookCatalog) -> TypedHookResult<()
 }
 
 fn validate_typed_hook_catalog_index(catalog: &TypedHookCatalog) -> TypedHookResult<()> {
-    if catalog.version != IR_VERSION {
+    validate_catalog_header(catalog.version, &catalog.kind, &catalog.contracts)?;
+    validate_catalog_hook_count(catalog.hooks.len(), catalog.adapters.len())?;
+    for (id, entry) in &catalog.hooks {
+        validate_hook_entry(id, entry)?;
+    }
+    for (id, entry) in &catalog.adapters {
+        validate_adapter_entry(id, entry, catalog.hooks.contains_key(id))?;
+    }
+    Ok(())
+}
+
+/// Everything about a catalog except its entries.
+fn validate_catalog_header(version: u64, kind: &str, contracts: &TypedHookContracts) -> TypedHookResult<()> {
+    if version != IR_VERSION {
         return Err(TypedHookError::new(format!(
-            "typed hook catalog version {} is unsupported",
-            catalog.version
+            "typed hook catalog version {version} is unsupported"
         )));
     }
-    if catalog.kind != CATALOG_KIND {
+    if kind != CATALOG_KIND {
         return Err(TypedHookError::new(format!(
-            "typed hook catalog kind {:?} is unsupported",
-            catalog.kind
+            "typed hook catalog kind {kind:?} is unsupported"
         )));
     }
 
     validate_sidecar_contract(
-        &catalog.contracts.trigger,
+        &contracts.trigger,
         &[TypedValueType::String, TypedValueType::String],
         TypedValueType::Bool,
         "trigger",
     )?;
     validate_sidecar_contract(
-        &catalog.contracts.get_query_term,
+        &contracts.get_query_term,
         &[TypedValueType::String],
         TypedValueType::String,
         "getQueryTerm",
     )?;
     validate_sidecar_contract(
-        &catalog.contracts.post_process,
+        &contracts.post_process,
         &[TypedValueType::String, TypedValueType::StringArray],
         TypedValueType::SuggestionArray,
         "postProcess",
     )?;
     validate_sidecar_contract(
-        &catalog.contracts.script,
+        &contracts.script,
         &[TypedValueType::StringArray],
         TypedValueType::StringArray,
         "script",
     )?;
     validate_sidecar_contract(
-        &catalog.contracts.custom,
+        &contracts.custom,
         &[
             TypedValueType::StringArray,
             TypedValueType::Exec,
@@ -1687,66 +1878,74 @@ fn validate_typed_hook_catalog_index(catalog: &TypedHookCatalog) -> TypedHookRes
         "custom",
     )?;
     validate_sidecar_contract(
-        &catalog.contracts.alias,
+        &contracts.alias,
         &[TypedValueType::String, TypedValueType::Exec],
         TypedValueType::String,
         "alias",
     )?;
     validate_sidecar_contract(
-        &catalog.contracts.load_spec,
+        &contracts.load_spec,
         &[TypedValueType::String, TypedValueType::Exec],
         TypedValueType::Spec,
         "loadSpec",
     )?;
     validate_sidecar_contract(
-        &catalog.contracts.generate_spec,
+        &contracts.generate_spec,
         &[TypedValueType::StringArray, TypedValueType::Exec],
         TypedValueType::Spec,
         "generateSpec",
     )?;
     validate_sidecar_contract(
-        &catalog.contracts.filter_template_suggestions,
+        &contracts.filter_template_suggestions,
         &[TypedValueType::SuggestionArray],
         TypedValueType::SuggestionArray,
         "filterTemplateSuggestions",
     )?;
-    if catalog.hooks.len() + catalog.adapters.len() > MAX_CATALOG_HOOKS {
+    Ok(())
+}
+
+fn validate_catalog_hook_count(hooks: usize, adapters: usize) -> TypedHookResult<()> {
+    if hooks + adapters > MAX_CATALOG_HOOKS {
         return Err(TypedHookError::new(format!(
             "typed hook catalog contains more than {MAX_CATALOG_HOOKS} hooks"
         )));
     }
+    Ok(())
+}
 
-    for (id, entry) in &catalog.hooks {
-        validate_hook_id(id)?;
-        validate_module_file(&entry.module)?;
-        validate_source_hook_path(&entry.path)?;
-        validate_sha256(&entry.module_sha256, "moduleSha256")?;
-        validate_sha256(&entry.function_body_sha256, "functionBodySha256")?;
-        if !SIDECAR_SOURCE_FIELDS.contains(&entry.source_field.as_str()) {
-            return Err(TypedHookError::new(format!(
-                "typed hook {id:?} sourceField must be one of the sidecar contracts"
-            )));
-        }
-        if entry.descriptor.raw_json().len() > MAX_SERIALIZED_DESCRIPTOR_BYTES {
-            return Err(TypedHookError::new(format!(
-                "typed hook descriptor exceeds {MAX_SERIALIZED_DESCRIPTOR_BYTES} bytes"
-            )));
-        }
+fn validate_hook_entry(id: &str, entry: &TypedHookCatalogEntry) -> TypedHookResult<()> {
+    validate_hook_id(id)?;
+    validate_module_file(&entry.module)?;
+    validate_source_hook_path(&entry.path)?;
+    validate_sha256(&entry.module_sha256, "moduleSha256")?;
+    validate_sha256(&entry.function_body_sha256, "functionBodySha256")?;
+    if !SIDECAR_SOURCE_FIELDS.contains(&entry.source_field.as_str()) {
+        return Err(TypedHookError::new(format!(
+            "typed hook {id:?} sourceField must be one of the sidecar contracts"
+        )));
     }
-    for (id, entry) in &catalog.adapters {
-        validate_hook_id(id)?;
-        if catalog.hooks.contains_key(id) {
-            return Err(TypedHookError::new(format!(
-                "typed hook {id:?} cannot be both a typed descriptor and an adapter binding"
-            )));
-        }
-        validate_source_hook_path(&entry.path)?;
-        validate_sha256(&entry.function_body_sha256, "functionBodySha256")?;
-        if !SIDECAR_SOURCE_FIELDS.contains(&entry.source_field.as_str()) {
-            return Err(TypedHookError::new(format!(
-                "typed hook adapter {id:?} sourceField must be one of the sidecar contracts"
-            )));
-        }
+    if entry.descriptor.raw_json().len() > MAX_SERIALIZED_DESCRIPTOR_BYTES {
+        return Err(TypedHookError::new(format!(
+            "typed hook descriptor exceeds {MAX_SERIALIZED_DESCRIPTOR_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// `also_typed`: the same id has a typed descriptor, which is an error.
+fn validate_adapter_entry(id: &str, entry: &TypedHookAdapterBinding, also_typed: bool) -> TypedHookResult<()> {
+    validate_hook_id(id)?;
+    if also_typed {
+        return Err(TypedHookError::new(format!(
+            "typed hook {id:?} cannot be both a typed descriptor and an adapter binding"
+        )));
+    }
+    validate_source_hook_path(&entry.path)?;
+    validate_sha256(&entry.function_body_sha256, "functionBodySha256")?;
+    if !SIDECAR_SOURCE_FIELDS.contains(&entry.source_field.as_str()) {
+        return Err(TypedHookError::new(format!(
+            "typed hook adapter {id:?} sourceField must be one of the sidecar contracts"
+        )));
     }
     Ok(())
 }

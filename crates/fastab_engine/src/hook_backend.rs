@@ -16,10 +16,12 @@ use crate::process::{self, CommandError};
 use crate::runtime::Suggestion;
 use crate::snapshot::DirectorySnapshot;
 use crate::typed_hook::{
-    RuntimeTypedHookCatalog, TypedExecRequest, TypedExecResult, TypedHookContext, TypedHookError, TypedHookIr,
-    evaluate_typed_alias, evaluate_typed_custom, evaluate_typed_filter_template_suggestions,
-    evaluate_typed_generate_spec, evaluate_typed_get_query_term, evaluate_typed_load_spec, evaluate_typed_post_process,
-    evaluate_typed_script, evaluate_typed_trigger, parse_typed_hook_catalog_bytes, suggestions_from_typed_json,
+    LazyTypedHookIr, RuntimeTypedHookAdapter, RuntimeTypedHookCatalog, TypedExecRequest, TypedExecResult,
+    TypedHookCatalogIndex, TypedHookContext, TypedHookError, TypedHookIr, evaluate_typed_alias, evaluate_typed_custom,
+    evaluate_typed_filter_template_suggestions, evaluate_typed_generate_spec, evaluate_typed_get_query_term,
+    evaluate_typed_load_spec, evaluate_typed_post_process, evaluate_typed_script, evaluate_typed_trigger,
+    index_typed_hook_catalog_bytes, parse_typed_hook_block, parse_typed_hook_catalog_bytes,
+    suggestions_from_typed_json,
 };
 
 const TYPED_HOOKS_FILE: &str = "typed-hooks.json";
@@ -27,7 +29,137 @@ const TYPED_HOOKS_FILE: &str = "typed-hooks.json";
 pub struct NativeHooks {
     source: Option<NativeHookSource>,
     // None inside the initialized cell means missing/rejected, not unloaded.
-    catalog: OnceLock<Option<RuntimeTypedHookCatalog>>,
+    catalog: OnceLock<Option<CatalogView>>,
+}
+
+enum CatalogView {
+    /// The whole sidecar, parsed at once: no snapshot, or no usable index.
+    Whole(RuntimeTypedHookCatalog),
+    /// One command's block at a time, from the generation's pinned sidecar.
+    Blocks(BlockCatalog),
+}
+
+struct BlockCatalog {
+    sidecar: Arc<IndexedSidecar>,
+    /// Parallel to the index's blocks. `None` inside a cell: unreadable or rejected.
+    blocks: Vec<OnceLock<Option<RuntimeTypedHookCatalog>>>,
+    snapshot: DirectorySnapshot,
+}
+
+/// Built once per snapshot generation and kept by the snapshot, so the
+/// engine's idle reset of this owner costs a block read, not a rescan.
+#[cfg(unix)]
+struct IndexedSidecar {
+    file: crate::snapshot::PinnedFile,
+    index: TypedHookCatalogIndex,
+}
+
+#[cfg(not(unix))]
+struct IndexedSidecar {
+    index: TypedHookCatalogIndex,
+}
+
+impl IndexedSidecar {
+    #[cfg(unix)]
+    fn is_intact(&self) -> bool {
+        self.file.is_intact()
+    }
+
+    #[cfg(not(unix))]
+    fn is_intact(&self) -> bool {
+        true
+    }
+}
+
+impl BlockCatalog {
+    fn block(&self, hook_id: &str) -> Option<&RuntimeTypedHookCatalog> {
+        let position = self.sidecar.index.position(hook_id)?;
+        self.blocks[position].get_or_init(|| self.load(position)).as_ref()
+    }
+
+    #[cfg(unix)]
+    fn load(&self, position: usize) -> Option<RuntimeTypedHookCatalog> {
+        let (hooks, adapters) = self.sidecar.index.ranges(position);
+        let read = |range: Option<std::ops::Range<usize>>| match range {
+            None => Ok(None),
+            Some(range) => self.sidecar.file.read_range(range).map(Some),
+        };
+        let members = read(hooks).and_then(|hooks| read(adapters).map(|adapters| (hooks, adapters)));
+        let (hooks, adapters) = match members {
+            Ok(members) => members,
+            Err(error) => {
+                // The pinned inode moved: this generation is no longer intact.
+                self.snapshot.mark_stale();
+                tracing::warn!(%error, "typed hook block unreadable");
+                return None;
+            },
+        };
+        match parse_typed_hook_block(hooks.as_deref(), adapters.as_deref()) {
+            Ok(block) => Some(block),
+            Err(error) => {
+                tracing::warn!(%error, "typed hook block rejected");
+                None
+            },
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn load(&self, _position: usize) -> Option<RuntimeTypedHookCatalog> {
+        None
+    }
+
+    fn descriptor_counts(&self) -> (usize, usize) {
+        self.blocks
+            .iter()
+            .filter_map(|block| block.get()?.as_ref())
+            .map(RuntimeTypedHookCatalog::descriptor_counts)
+            .fold((0, 0), |(all, parsed), (more, more_parsed)| {
+                (all + more, parsed + more_parsed)
+            })
+    }
+}
+
+impl CatalogView {
+    fn descriptor(&self, hook_id: &str) -> Option<&LazyTypedHookIr> {
+        match self {
+            Self::Whole(catalog) => catalog.hooks.get(hook_id),
+            Self::Blocks(catalog) => catalog.block(hook_id)?.hooks.get(hook_id),
+        }
+    }
+
+    fn adapter(&self, hook_id: &str) -> Option<&RuntimeTypedHookAdapter> {
+        match self {
+            Self::Whole(catalog) => catalog.adapters.get(hook_id),
+            Self::Blocks(catalog) => catalog.block(hook_id)?.adapters.get(hook_id),
+        }
+    }
+}
+
+/// The generation's block index over `typed-hooks.json`, if it has one. The
+/// first build still consumes the bytes captured while the snapshot hashed
+/// the tree; it reads the file again through a descriptor it keeps.
+#[cfg(unix)]
+fn indexed_sidecar(snapshot: &DirectorySnapshot) -> Option<Arc<IndexedSidecar>> {
+    let path = Path::new(TYPED_HOOKS_FILE);
+    if !snapshot.is_file(path) {
+        return None;
+    }
+    snapshot.sidecar_index(|| {
+        drop(snapshot.take_captured_file(path));
+        let (file, bytes) = snapshot.pin_file(path).ok()?;
+        match index_typed_hook_catalog_bytes(&bytes) {
+            Ok(index) => Some(IndexedSidecar { file, index }),
+            Err(error) => {
+                tracing::debug!(%error, "typed hook catalog has no block index; parsing it whole");
+                None
+            },
+        }
+    })
+}
+
+#[cfg(not(unix))]
+fn indexed_sidecar(_snapshot: &DirectorySnapshot) -> Option<Arc<IndexedSidecar>> {
+    None
 }
 
 struct NativeHookSource {
@@ -40,7 +172,7 @@ impl NativeHooks {
     pub(crate) fn from_catalog(catalog: crate::typed_hook::TypedHookCatalog) -> Self {
         Self {
             source: None,
-            catalog: OnceLock::from(Some(catalog.into_runtime())),
+            catalog: OnceLock::from(Some(CatalogView::Whole(catalog.into_runtime()))),
         }
     }
 
@@ -56,13 +188,31 @@ impl NativeHooks {
         }
     }
 
-    fn catalog(&self) -> Option<&RuntimeTypedHookCatalog> {
+    fn catalog(&self) -> Option<&CatalogView> {
         self.catalog
             .get_or_init(|| {
                 let source = self.source.as_ref()?;
+                if let Some(snapshot) = source.snapshot.as_ref()
+                    && let Some(sidecar) = indexed_sidecar(snapshot)
+                {
+                    // As a whole-file read would: a sidecar changed since it
+                    // was verified leaves the catalog unloaded and the
+                    // generation stale.
+                    if !sidecar.is_intact() {
+                        snapshot.mark_stale();
+                        tracing::warn!("typed hook catalog changed after its generation was opened");
+                        return None;
+                    }
+                    let blocks = (0..sidecar.index.len()).map(|_| OnceLock::new()).collect();
+                    return Some(CatalogView::Blocks(BlockCatalog {
+                        sidecar,
+                        blocks,
+                        snapshot: snapshot.clone(),
+                    }));
+                }
                 let typed_bytes = read_sidecar(&source.specs_dir, source.snapshot.as_ref(), TYPED_HOOKS_FILE)?;
                 match parse_typed_hook_catalog_bytes(&typed_bytes) {
-                    Ok(catalog) => Some(catalog.into_runtime()),
+                    Ok(catalog) => Some(CatalogView::Whole(catalog.into_runtime())),
                     Err(error) => {
                         tracing::warn!(%error, "typed hook catalog rejected");
                         None
@@ -85,12 +235,19 @@ impl NativeHooks {
                 ..Default::default()
             };
         };
-        let (descriptor_count, parsed_descriptor_count) = catalog.descriptor_counts();
+        let ((descriptor_count, parsed_descriptor_count), typed_entries, adapter_entries) = match catalog {
+            CatalogView::Whole(catalog) => (catalog.descriptor_counts(), catalog.hooks.len(), catalog.adapters.len()),
+            CatalogView::Blocks(catalog) => (
+                catalog.descriptor_counts(),
+                catalog.sidecar.index.hook_count(),
+                catalog.sidecar.index.adapter_count(),
+            ),
+        };
         crate::diagnostics::HookCatalogDiagnostics {
             load_attempted: true,
             loaded: true,
-            typed_entries: catalog.hooks.len(),
-            adapter_entries: catalog.adapters.len(),
+            typed_entries,
+            adapter_entries,
             descriptor_count,
             parsed_descriptor_count,
             captured_bytes,
@@ -372,14 +529,14 @@ fn typed_entry<'a>(native: &'a NativeHooks, hook_id: &str) -> Result<Option<&'a 
     let Some(catalog) = native.catalog() else {
         return Ok(None);
     };
-    match catalog.hooks.get(hook_id) {
+    match catalog.descriptor(hook_id) {
         Some(descriptor) => descriptor.get().map(Some),
         None => Ok(None),
     }
 }
 
 fn adapter_sha<'a>(native: &'a NativeHooks, hook_id: &str, field: &str) -> Option<&'a str> {
-    let entry = native.catalog()?.adapters.get(hook_id)?;
+    let entry = native.catalog()?.adapter(hook_id)?;
     (entry.source_field == field).then_some(entry.function_body_sha256.as_str())
 }
 
@@ -1046,5 +1203,91 @@ mod tests {
         let record = last_diagnostic().expect("native miss records a diagnostic");
         assert_eq!(record.hook_id, "missing#trigger#0");
         assert_eq!(record.outcome, HookDiagnostic::SourceMissing);
+    }
+
+    /// Two git triggers with distinct bodies, then npm's hook with a third.
+    fn block_entries() -> [(String, JsonValue); 3] {
+        [
+            test_typed_entry(
+                "git#trigger#0",
+                "trigger",
+                serde_json::json!({"op": "bool", "value": true}),
+            ),
+            test_typed_entry(
+                "git#trigger#1",
+                "trigger",
+                serde_json::json!({"op": "bool", "value": false}),
+            ),
+            test_typed_entry(
+                "npm#getQueryTerm#0",
+                "getQueryTerm",
+                serde_json::json!({"op": "string", "value": "x"}),
+            ),
+        ]
+    }
+
+    fn write_catalog(dir: &Path, entries: Vec<(String, JsonValue)>) {
+        let catalog = serde_json::json!({
+            "version": 1,
+            "kind": "typed-hook-expressions",
+            "contracts": test_sidecar_contracts(),
+            "hooks": JsonValue::Object(entries.into_iter().collect()),
+        });
+        std::fs::write(dir.join(TYPED_HOOKS_FILE), catalog.to_string()).unwrap();
+    }
+
+    #[test]
+    fn a_snapshot_parses_only_the_dispatched_commands_block() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(dir.path(), block_entries().into());
+        let snapshot = DirectorySnapshot::open(dir.path()).unwrap();
+        let native = Arc::new(NativeHooks::new(dir.path(), Some(snapshot.clone())));
+        {
+            let _bound = bind_native(Arc::clone(&native));
+            assert_eq!(dispatch_trigger("git#trigger#0", "a", "b"), Some(true));
+            assert_eq!(dispatch_trigger("git#trigger#1", "a", "b"), Some(false));
+            assert!(dispatch_trigger("missing#trigger#0", "a", "b").is_none());
+        }
+        let diagnostics = native.diagnostics();
+        assert!(diagnostics.loaded);
+        assert_eq!(diagnostics.typed_entries, 3, "the index counts every hook");
+        assert_eq!(diagnostics.descriptor_count, 2, "only git's block was parsed");
+        assert_eq!(diagnostics.captured_bytes, 0, "the first index build consumes them");
+        // The engine replaces its owner after every idle grace; the next one
+        // reads its block through the index the snapshot kept.
+        let next = Arc::new(NativeHooks::new(dir.path(), Some(snapshot)));
+        let _bound = bind_native(Arc::clone(&next));
+        assert_eq!(
+            dispatch_get_query_term("npm#getQueryTerm#0", "abc").as_deref(),
+            Some("x")
+        );
+        assert_eq!(next.diagnostics().descriptor_count, 1);
+        assert_eq!(next.diagnostics().typed_entries, 3);
+    }
+
+    #[test]
+    fn a_catalog_without_contiguous_blocks_is_parsed_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let [git_true, git_false, npm] = block_entries();
+        write_catalog(dir.path(), vec![git_true, npm, git_false]);
+        let snapshot = DirectorySnapshot::open(dir.path()).unwrap();
+        let native = Arc::new(NativeHooks::new(dir.path(), Some(snapshot)));
+        let _bound = bind_native(Arc::clone(&native));
+        assert_eq!(dispatch_trigger("git#trigger#1", "a", "b"), Some(false));
+        assert_eq!(native.diagnostics().descriptor_count, 3, "the whole catalog was parsed");
+    }
+
+    #[test]
+    fn an_escaped_key_cannot_be_indexed_and_is_parsed_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        write_catalog(dir.path(), block_entries().into());
+        let path = dir.path().join(TYPED_HOOKS_FILE);
+        let text = std::fs::read_to_string(&path).unwrap();
+        std::fs::write(&path, text.replace("\"git#trigger#1\"", "\"git\\u0023trigger#1\"")).unwrap();
+        let snapshot = DirectorySnapshot::open(dir.path()).unwrap();
+        let native = Arc::new(NativeHooks::new(dir.path(), Some(snapshot)));
+        let _bound = bind_native(Arc::clone(&native));
+        assert_eq!(dispatch_trigger("git#trigger#1", "a", "b"), Some(false));
+        assert_eq!(native.diagnostics().descriptor_count, 3, "the whole catalog was parsed");
     }
 }
