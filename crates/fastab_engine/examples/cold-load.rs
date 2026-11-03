@@ -43,8 +43,18 @@ fn main() -> anyhow::Result<()> {
             .with_context(|| format!("complete {buffer:?}"))?;
         Ok(started.elapsed())
     };
-    complete("git ")?;
-    println!("first request, engine start included: {:.1}", ms(started.elapsed()));
+    let spawned = started.elapsed();
+    // The first request builds the engine; an unknown command loads no spec
+    // and runs no hook, so it times that build alone.
+    let engine = complete("fastab-cold-load-unknown ")?;
+    let git = complete("git ")?;
+    println!(
+        "first request {:.1}: client spawn {:.1}, engine build {:.1}, then `git ` {:.1}",
+        ms(started.elapsed()),
+        ms(spawned),
+        ms(engine),
+        ms(git)
+    );
     for buffer in BUFFERS {
         let mut idle = Vec::with_capacity(ROUNDS);
         let mut warm = Vec::with_capacity(ROUNDS);
