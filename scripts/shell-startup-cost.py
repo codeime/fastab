@@ -83,8 +83,13 @@ def main():
         os.mkdir(integrated)
         open(os.path.join(bare, ".zshrc"), "w").close()
         with open(os.path.join(integrated, ".zshrc"), "w") as rc:
+            # The installed zshrc.pre.zsh / zshrc.post.zsh shims: the post one
+            # evaluates what pre handed over and runs ftab only without it.
             rc.write(f"eval \"$('{ftab}' init zsh pre --rcfile zshrc)\"\n")
-            rc.write(f"eval \"$('{ftab}' init zsh post --rcfile zshrc)\"\n")
+            rc.write(
+                'if [ -n "${__fastab_post_zshrc+x}" ]; then eval "$__fastab_post_zshrc"; unset __fastab_post_zshrc; '
+                f"else eval \"$('{ftab}' init zsh post --rcfile zshrc)\"; fi\n"
+            )
         shell = ["/bin/zsh", "-i", "-c", "exit"]
         cases = [
             ("/usr/bin/true", ["/usr/bin/true"], base),

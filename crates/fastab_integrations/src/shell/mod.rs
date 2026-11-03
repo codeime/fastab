@@ -229,6 +229,18 @@ pub struct ShellScriptShellIntegration {
     pub path: PathBuf,
 }
 
+/// The variable through which `init <shell> pre` hands the matching post
+/// script to the post shim of the same rc file, so a shell start runs the
+/// CLI once per rc file instead of twice. zsh and bash shims read it.
+pub fn post_handoff_variable(rcfile: Option<&str>) -> String {
+    let name: String = rcfile
+        .unwrap_or("rc")
+        .chars()
+        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
+        .collect();
+    format!("__fastab_post_{name}")
+}
+
 fn get_prefix(s: &str) -> &str {
     match s.find('.') {
         Some(i) => &s[..i],
@@ -327,17 +339,23 @@ impl ShellScriptShellIntegration {
     #[allow(clippy::needless_return)]
     fn get_contents(&self) -> String {
         let Self { shell, when, path } = self;
-        let rcfile = match path.file_name().and_then(|x| x.to_str()) {
-            Some(name) => format!(" --rcfile {}", get_prefix(name)),
+        let prefix = path.file_name().and_then(|x| x.to_str()).map(get_prefix);
+        let rcfile = match prefix {
+            Some(name) => format!(" --rcfile {name}"),
             None => "".into(),
         };
         cfg_if!(
             if #[cfg(target_os = "macos")] {
-                return match self.shell {
+                // The pre run usually hands over the post script already; the
+                // CLI only runs again when it did not (an older pre, or an
+                // input method prompt that the post run has to count).
+                let handoff = post_handoff_variable(prefix);
+                return match (self.shell, when) {
                     // Check if ~/.local/bin/{CLI_BINARY_NAME} is executable before eval
-                    Shell::Bash | Shell::Zsh => format!("[ -x ~/.local/bin/{CLI_BINARY_NAME} ] && eval \"$(~/.local/bin/{CLI_BINARY_NAME} init {shell} {when}{rcfile})\""),
-                    Shell::Fish => format!("test -x ~/.local/bin/{CLI_BINARY_NAME}; and eval (~/.local/bin/{CLI_BINARY_NAME} init {shell} {when}{rcfile} | string split0)"),
-                    Shell::Nu => "".into(),
+                    (Shell::Bash | Shell::Zsh, When::Pre) => format!("[ -x ~/.local/bin/{CLI_BINARY_NAME} ] && eval \"$(~/.local/bin/{CLI_BINARY_NAME} init {shell} {when}{rcfile})\""),
+                    (Shell::Bash | Shell::Zsh, When::Post) => format!("if [ -n \"${{{handoff}+x}}\" ]; then eval \"${handoff}\"; unset {handoff}; elif [ -x ~/.local/bin/{CLI_BINARY_NAME} ]; then eval \"$(~/.local/bin/{CLI_BINARY_NAME} init {shell} {when}{rcfile})\"; fi"),
+                    (Shell::Fish, _) => format!("test -x ~/.local/bin/{CLI_BINARY_NAME}; and eval (~/.local/bin/{CLI_BINARY_NAME} init {shell} {when}{rcfile} | string split0)"),
+                    (Shell::Nu, _) => "".into(),
                 }
             } else {
                 let add_to_path_line = match self.shell {

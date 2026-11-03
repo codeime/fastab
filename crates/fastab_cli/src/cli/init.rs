@@ -8,7 +8,7 @@ use std::sync::LazyLock;
 use clap::Args;
 use crossterm::style::Stylize;
 use eyre::Result;
-use fastab_integrations::shell::{ShellExt, When};
+use fastab_integrations::shell::{ShellExt, When, post_handoff_variable};
 use fastab_os_shim::{Context, Env};
 use fastab_util::env_var::Q_SHELL;
 use fastab_util::{CLI_BINARY_NAME, PRODUCT_NAME, Shell, Terminal, get_parent_process_exe};
@@ -140,15 +140,20 @@ async fn shell_init(shell: &Shell, when: &When, rcfile: &Option<String>) -> Resu
     // When the desktop app is not running, skip pre/post hooks entirely so other
     // terminal integrations (VS Code Terminal Suggest, Otty, etc.) keep working.
     if !*IS_SNAPSHOT_TEST && suppress_without_desktop_app(&Env::new()) {
-        return Ok(format!(
-            "# {PRODUCT_NAME} desktop app is not running; skipping shell integration\n"
-        ));
+        let mut source = format!("# {PRODUCT_NAME} desktop app is not running; skipping shell integration\n");
+        if when == &When::Pre && hands_over_post(shell) {
+            // The post run would only reach the same verdict.
+            source.push_str(&format!("{}=''\n", post_handoff_variable(rcfile.as_deref())));
+        }
+        return Ok(source);
     }
 
     let mut to_source = Vec::new();
+    // Assignments both runs make; the post script handed over by pre repeats them.
+    let mut shared = Vec::new();
 
     if let Some(parent_process) = get_parent_process_exe() {
-        to_source.push(assign_shell_variable(
+        shared.push(assign_shell_variable(
             shell,
             Q_SHELL,
             if *IS_SNAPSHOT_TEST {
@@ -159,6 +164,7 @@ async fn shell_init(shell: &Shell, when: &When, rcfile: &Option<String>) -> Resu
             false,
         ));
     };
+    to_source.extend(shared.iter().cloned());
 
     if when == &When::Pre {
         let status = if *IS_SNAPSHOT_TEST {
@@ -179,7 +185,9 @@ async fn shell_init(shell: &Shell, when: &When, rcfile: &Option<String>) -> Resu
     }
 
     if let Some(path) = fastab_settings::settings::get_string_opt("qterm.path") {
-        to_source.push(assign_shell_variable(shell, "Q_TERM_PATH", path, false));
+        let assignment = assign_shell_variable(shell, "Q_TERM_PATH", path, false);
+        to_source.push(assignment.clone());
+        shared.push(assignment);
     }
 
     let shell_integration_source = shell.get_fig_integration_source(when);
@@ -232,31 +240,84 @@ async fn shell_init(shell: &Shell, when: &When, rcfile: &Option<String>) -> Resu
 
     #[cfg(target_os = "macos")]
     if when == &When::Post
-        && !fastab_integrations::input_method::InputMethod::default()
-            .is_enabled()
-            .unwrap_or(false)
+        && let Some(prompt) = input_method_prompt()
     {
-        if let Some(terminal) = Terminal::parent_terminal(&Context::new()) {
-            let prompt_state_key = format!("prompt.input-method.{}.count", terminal.internal_id());
-            let prompt_count = fastab_settings::state::get_int_or(&prompt_state_key, 0);
-            let running_version = if terminal == Terminal::Otty {
-                terminal
-                    .to_bundle_id()
-                    .and_then(|bundle| macos_utils::applications::unique_running_application_version(&bundle))
-            } else {
-                None
-            };
-            if terminal.supports_macos_input_method()
-                && !terminal.prefers_macos_accessibility(running_version.as_deref())
-                && prompt_count < 2
-            {
-                let _ = fastab_settings::state::set_value(&prompt_state_key, prompt_count + 1);
-                to_source.push(input_method_prompt_code(*shell, &terminal));
-            }
-        }
+        let _ = fastab_settings::state::set_value(&prompt.state_key, prompt.count + 1);
+        to_source.push(input_method_prompt_code(*shell, &prompt.terminal));
+    }
+
+    // Hand the post script to the post shim, which then runs nothing. Not
+    // when post owes an input method prompt: only the post run may count one,
+    // and a pre run can belong to the shell that execs into fterm and never
+    // reaches post.
+    if when == &When::Pre && hands_over_post(shell) && (*IS_SNAPSHOT_TEST || !prompts_for_input_method()) {
+        shared.push(shell.get_fig_integration_source(&When::Post));
+        to_source.push(format!(
+            "# shellcheck disable=SC1003,SC2016,SC2034\n{}={}",
+            post_handoff_variable(rcfile.as_deref()),
+            single_quoted(&shared.join("\n"))
+        ));
     }
 
     Ok(to_source.join("\n"))
+}
+
+/// Only the zsh and bash post shims read the handed-over script.
+fn hands_over_post(shell: &Shell) -> bool {
+    matches!(shell, Shell::Bash | Shell::Zsh)
+}
+
+/// `'…'`: a POSIX single-quoted word, closing and reopening the quotes around
+/// each `'` in `value`.
+fn single_quoted(value: &str) -> String {
+    format!("'{}'", value.replace('\'', r"'\''"))
+}
+
+#[cfg(target_os = "macos")]
+struct InputMethodPrompt {
+    state_key: String,
+    count: i64,
+    terminal: Terminal,
+}
+
+/// The input method prompt the post script shows at most twice per terminal.
+#[cfg(target_os = "macos")]
+fn input_method_prompt() -> Option<InputMethodPrompt> {
+    if fastab_integrations::input_method::InputMethod::default()
+        .is_enabled()
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let terminal = Terminal::parent_terminal(&Context::new())?;
+    let state_key = format!("prompt.input-method.{}.count", terminal.internal_id());
+    let count = fastab_settings::state::get_int_or(&state_key, 0);
+    let running_version = if terminal == Terminal::Otty {
+        terminal
+            .to_bundle_id()
+            .and_then(|bundle| macos_utils::applications::unique_running_application_version(&bundle))
+    } else {
+        None
+    };
+    (terminal.supports_macos_input_method()
+        && !terminal.prefers_macos_accessibility(running_version.as_deref())
+        && count < 2)
+        .then_some(InputMethodPrompt {
+            state_key,
+            count,
+            terminal,
+        })
+}
+
+fn prompts_for_input_method() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        input_method_prompt().is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
 }
 
 fn shell_integrations_disabled_code(shell: Shell) -> String {
@@ -312,6 +373,16 @@ mod tests {
             assign_shell_variable(&Shell::Bash, "Q_SHELL", "/bin/zsh", false),
             r#"Q_SHELL="/bin/zsh""#
         );
+    }
+
+    #[test]
+    fn the_handed_over_post_script_survives_quoting_in_zsh_and_bash() {
+        let script = "printf '%s\\n' \"it's $HOME\" 'done'\n";
+        for shell in [Shell::Zsh, Shell::Bash] {
+            let handoff = format!("x={}\nprintf %s \"$x\"", single_quoted(script));
+            let output = Command::new(shell.as_str()).args(["-c", &handoff]).output().unwrap();
+            assert_eq!(String::from_utf8(output.stdout).unwrap(), script, "{shell:?}");
+        }
     }
 
     #[test]
