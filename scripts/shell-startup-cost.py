@@ -22,6 +22,39 @@ import tempfile
 import time
 
 
+FRAMEWORK_PROBES = {
+    # ftab binds TIS symbols from Carbon, whose HIToolbox pulls SkyLight and
+    # most of the UI stack; AppKit and seven more frameworks are linked with
+    # nothing bound. These empty programs price that load on the runner.
+    "empty C program": ("int main(void) { return 0; }", []),
+    "+ Carbon (TIS bound)": (
+        "extern void *TISCreateInputSourceList(void *, int);\n"
+        "int main(int argc, char **argv) { if (argc > 99) TISCreateInputSourceList(0, 0); return 0; }",
+        ["-framework", "Carbon"],
+    ),
+    "+ AppKit (linked, unused)": (
+        "int main(void) { return 0; }",
+        ["-Wl,-needed_framework,AppKit"],
+    ),
+}
+
+
+def build_probes(root):
+    probes = []
+    for name, (source, flags) in FRAMEWORK_PROBES.items():
+        path = os.path.join(root, f"probe{len(probes)}")
+        with open(path + ".c", "w") as handle:
+            handle.write(source)
+        built = subprocess.run(
+            ["xcrun", "clang", "-O2", "-o", path, path + ".c", *flags],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        if built.returncode == 0:
+            probes.append((name, [path]))
+    return probes
+
+
 def run(argv, env):
     started = time.perf_counter()
     subprocess.run(argv, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -55,6 +88,7 @@ def main():
         shell = ["/bin/zsh", "-i", "-c", "exit"]
         cases = [
             ("/usr/bin/true", ["/usr/bin/true"], base),
+            *((name, argv, base) for name, argv in build_probes(root)),
             ("ftab --version (clap, no runtime)", [ftab, "--version"], base),
             ("ftab _ pre-cmd (launch only)", [ftab, "_", "pre-cmd"], base),
             ("ftab _ get-shell", [ftab, "_", "get-shell"], base),
