@@ -455,6 +455,7 @@ impl DirectorySnapshot {
     }
 
     #[cfg(unix)]
+    #[allow(clippy::verbose_file_reads)]
     fn read_pinned(&self, relative: &Path, expected: &str) -> io::Result<(PinnedFile, Vec<u8>)> {
         let root_fd = open_root(&self.inner.display_path)?;
         let fd = open_relative(root_fd.as_raw_fd(), relative)?;
@@ -572,14 +573,87 @@ fn open_relative(parent_fd: i32, relative: &Path) -> io::Result<OwnedFd> {
     Ok(current)
 }
 
+/// Files opened by the walk and waiting for a hashing thread. Bounds the
+/// descriptors held at once beyond the directory chain.
 #[cfg(unix)]
-#[allow(clippy::verbose_file_reads)]
+const HASH_QUEUE: usize = 16;
+
+/// Hashing runs on up to this many threads while the walk continues.
+#[cfg(unix)]
+const MAX_HASH_THREADS: usize = 4;
+
+#[cfg(unix)]
+type HashedFile = (PathBuf, String, Option<Vec<u8>>);
+
+/// Walk the tree on this thread and hash its files on a few others. Opening
+/// a generation digested all ~880 IR files one after another: 126 ms of
+/// the first completion after launch on CI. The walk still opens and
+/// checks every entry in order; only reading and hashing are spread out.
+#[cfg(unix)]
 fn capture_tree(
-    parent_fd: i32,
+    root_fd: i32,
     current: &Path,
     entries: &mut HashMap<PathBuf, EntryKind>,
     file_digests: &mut HashMap<PathBuf, String>,
     captured_files: &mut HashMap<PathBuf, Vec<u8>>,
+) -> io::Result<()> {
+    let threads = std::thread::available_parallelism().map_or(1, |count| count.get().min(MAX_HASH_THREADS));
+    let (jobs, queued) = std::sync::mpsc::sync_channel::<(PathBuf, OwnedFd)>(HASH_QUEUE);
+    let (hashed, results) = std::sync::mpsc::channel::<io::Result<HashedFile>>();
+    let queued = Mutex::new(queued);
+    std::thread::scope(|scope| {
+        for _ in 0..threads {
+            let hashed = hashed.clone();
+            let queued = &queued;
+            scope.spawn(move || {
+                loop {
+                    let next = queued.lock().unwrap_or_else(|error| error.into_inner()).recv();
+                    let Ok((relative, fd)) = next else {
+                        break;
+                    };
+                    if hashed.send(hash_file(relative, fd)).is_err() {
+                        break;
+                    }
+                }
+            });
+        }
+        drop(hashed);
+        let walked = walk_tree(root_fd, current, entries, &jobs);
+        drop(jobs);
+        let mut failure = walked.err();
+        for result in results {
+            match result {
+                Ok((relative, digest, captured)) => {
+                    entries.insert(relative.clone(), EntryKind::File);
+                    if let Some(bytes) = captured {
+                        captured_files.insert(relative.clone(), bytes);
+                    }
+                    file_digests.insert(relative, digest);
+                },
+                Err(error) => {
+                    failure.get_or_insert(error);
+                },
+            }
+        }
+        failure.map_or(Ok(()), Err)
+    })
+}
+
+#[cfg(unix)]
+fn hash_file(relative: PathBuf, fd: OwnedFd) -> io::Result<HashedFile> {
+    let mut file = File::from(fd);
+    let mut captured = HashMap::new();
+    let digest = capture_file_digest(&mut file, &relative, &mut captured)?;
+    let bytes = captured.remove(&relative);
+    Ok((relative, digest, bytes))
+}
+
+#[cfg(unix)]
+fn walk_tree(
+    parent_fd: i32,
+    current: &Path,
+    entries: &mut HashMap<PathBuf, EntryKind>,
+    jobs: &std::sync::mpsc::SyncSender<(PathBuf, OwnedFd)>,
 ) -> io::Result<()> {
     for name in read_dir_fd(parent_fd)? {
         let bytes = name.as_os_str().as_bytes();
@@ -606,12 +680,11 @@ fn capture_tree(
         let relative = current.join(&name);
         if is_directory(&metadata) {
             entries.insert(relative.clone(), EntryKind::Directory);
-            capture_tree(fd.as_raw_fd(), &relative, entries, file_digests, captured_files)?;
+            walk_tree(fd.as_raw_fd(), &relative, entries, jobs)?;
         } else if is_regular_file(&metadata) {
-            let mut file = File::from(fd);
-            let digest = capture_file_digest(&mut file, &relative, captured_files)?;
-            entries.insert(relative.clone(), EntryKind::File);
-            file_digests.insert(relative, digest);
+            if jobs.send((relative, fd)).is_err() {
+                return Err(io::Error::other("snapshot hashing threads stopped"));
+            }
         } else {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
