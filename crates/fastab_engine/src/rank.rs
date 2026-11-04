@@ -15,10 +15,11 @@ use crate::history::ArgSlot;
 use crate::query::MatchScore;
 use crate::runtime::{CompleteResult, Suggestion};
 
-/// Fig did not cap unique history rows. Keep a high ceiling so ranking cannot
-/// drop a recent match the overlay would have shown, without walking an
-/// unbounded database on every keystroke.
-const HISTORY_LIMIT: usize = 10_000;
+/// History rows one request builds, newest first. Fig did not cap them, but a
+/// real shell history matches thousands: `git ` was 5,402 rows on the machine
+/// that found this, each a full suggestion built again for every keystroke and
+/// converted again for the overlay, which shows six. Typing narrows the rest.
+const HISTORY_LIMIT: usize = 200;
 const CUSTOM_HISTORY_TIMEOUT: Duration = Duration::from_secs(5);
 /// State key used for the native equivalent of the WebView's recency index.
 /// The value is a JSON object `{ command: { acceptedName: unixMillis } }`.
@@ -376,10 +377,8 @@ impl Frecency {
             .iter()
             .rev()
             .filter(|command| query.is_empty() || crate::query::matches_query(command, query, fuzzy))
-            .filter_map(|command| {
-                let command = command.trim_end();
-                seen.insert(command.to_string()).then_some(command)
-            })
+            .map(|command| command.trim_end())
+            .filter(|command| seen.insert(*command))
             .take(HISTORY_LIMIT)
             .map(|command| {
                 let priority = first_word_counts
@@ -404,20 +403,17 @@ impl Frecency {
             .iter()
             .rev()
             .filter_map(|command| {
-                if !command.starts_with(prefix) {
-                    return None;
-                }
-                let suffix = command[prefix.len()..].trim_end();
+                let suffix = command.strip_prefix(prefix)?.trim_end();
                 if suffix.is_empty() || (!query.is_empty() && !crate::query::matches_query(suffix, query, fuzzy)) {
                     return None;
                 }
-                seen.insert(suffix.to_string()).then_some(suffix.to_string())
+                seen.insert(suffix).then_some(suffix)
             })
             .take(HISTORY_LIMIT)
             .map(|suffix| {
                 let first_word = suffix.split_whitespace().next().unwrap_or_default();
                 let priority = first_word_counts.get(first_word).map_or(50, history_priority_base);
-                Suggestion::new(suffix.clone(), "past command", "history")
+                Suggestion::new(suffix, "past command", "history")
                     .with_insert_value(suffix)
                     .with_priority(priority)
             })
@@ -1959,6 +1955,25 @@ mod tests {
             "{:?}",
             result.suggestions
         );
+    }
+
+    #[test]
+    fn history_rows_stop_at_the_limit_with_the_newest_kept() {
+        let newest = HISTORY_LIMIT + 49;
+        let frecency = Frecency::from_commands((0..=newest).map(|i| (format!("git cmd{i}"), 0)));
+        let suffixes = frecency.history_suffix_suggestions("git ", "", false);
+        assert_eq!(suffixes.len(), HISTORY_LIMIT);
+        assert_eq!(suffixes[0].name, format!("cmd{newest}"));
+        assert_eq!(
+            suffixes[0].insert_value.as_deref(),
+            Some(format!("cmd{newest}").as_str())
+        );
+        let whole = frecency.history_suggestions("git", false, false);
+        assert_eq!(whole.len(), HISTORY_LIMIT);
+        assert_eq!(whole[0].name, format!("git cmd{newest}"));
+        // A narrower query finds a row the empty one left out.
+        let narrowed = frecency.history_suffix_suggestions("git ", "cmd0", false);
+        assert_eq!(narrowed.len(), 1);
     }
 
     #[test]

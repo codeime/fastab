@@ -88,7 +88,21 @@ pub fn match_score(name: &str, query: &str, fuzzy: bool) -> Option<MatchScore> {
 }
 
 pub fn matches_query(name: &str, query: &str, fuzzy: bool) -> bool {
-    query.is_empty() || match_score(name, query, fuzzy).is_some()
+    if query.is_empty() {
+        return true;
+    }
+    // History runs this over every line for a keystroke, and `match_score`
+    // lowercases a copy of both strings each time. ASCII needs neither copy.
+    if name.is_ascii() && query.is_ascii() {
+        let prefix = name
+            .as_bytes()
+            .get(..query.len())
+            .is_some_and(|start| start.eq_ignore_ascii_case(query.as_bytes()));
+        if prefix || !fuzzy {
+            return prefix;
+        }
+    }
+    match_score(name, query, fuzzy).is_some()
 }
 
 pub fn starts_with_ignore_case(name: &str, query: &str) -> bool {
@@ -279,6 +293,34 @@ pub fn fuzzy_indexes(name: &str, query: &str) -> Option<Vec<usize>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn matches_query_agrees_with_match_score() {
+        let names = [
+            "git",
+            "GIT status",
+            "gi",
+            "",
+            "checkout",
+            "ΟΣ",
+            "ΟΣ x",
+            "\u{212a}elvin",
+            "straße",
+        ];
+        let queries = ["git", "GI", "git status", "c", "x", "ος", "k", "STRASSE", "gts"];
+        for name in names {
+            for query in queries {
+                for fuzzy in [false, true] {
+                    assert_eq!(
+                        matches_query(name, query, fuzzy),
+                        match_score(name, query, fuzzy).is_some(),
+                        "{name:?} {query:?} fuzzy={fuzzy}"
+                    );
+                }
+            }
+            assert!(matches_query(name, "", false));
+        }
+    }
 
     #[test]
     fn prefix_and_fuzzy_match() {
