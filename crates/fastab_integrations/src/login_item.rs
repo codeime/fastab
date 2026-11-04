@@ -169,6 +169,8 @@ fn legacy_launch_agent(executable: PathBuf) -> LaunchdPlist {
             "--no-dashboard".to_owned(),
         ])
         .associated_bundle_identifiers([APP_BUNDLE_ID])
+        // This agent starts the binary directly, so `LSEnvironment` does not apply.
+        .environment_variable(fastab_util::malloc::SPACE_EFFICIENT, "1")
         .run_at_load(true)
         .keep_alive(false)
 }

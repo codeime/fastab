@@ -210,6 +210,7 @@ jobs:
           fi
           test "$(plutil -extract CFBundleIdentifier raw -o - "$plist")" = "app.fastab"
           test "$(plutil -extract CFBundleExecutable raw -o - "$plist")" = "fastab"
+          test "$(plutil -extract LSEnvironment.MallocSpaceEfficient raw -o - "$plist")" = "1"
           test "$(plutil -extract CFBundleName raw -o - "$plist")" = "Fastab"
           test "$(plutil -extract CFBundleDisplayName raw -o - "$plist")" = "Fastab"
           test "$(plutil -extract CFBundleDevelopmentRegion raw -o - "$plist")" = "en"

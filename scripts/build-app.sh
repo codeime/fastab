@@ -382,6 +382,16 @@ cat > "${STAGING_BUNDLE}/Contents/Info.plist" <<PLIST
     <true/>
     <key>LSUIElement</key>
     <true/>
+    <!--
+      Freed heap goes back to the system, about 25 MB of idle footprint. It has
+      to be set before main, and the app must not re-exec itself to do that: on
+      macOS 27 that loses its menu bar icon. See fastab_util::malloc.
+    -->
+    <key>LSEnvironment</key>
+    <dict>
+      <key>MallocSpaceEfficient</key>
+      <string>1</string>
+    </dict>
     <key>NSSupportsAutomaticGraphicsSwitching</key>
     <true/>
     <!--

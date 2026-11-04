@@ -57,7 +57,7 @@ struct Launch {
 }
 
 fn main() -> ExitCode {
-    fastab_util::malloc::start_space_efficient();
+    fastab_util::malloc::clear_space_efficient();
     fastab_util::build_identity::initialize();
     // The desktop process is I/O bound: GPUI owns the UI thread, and the
     // completion engine has its own worker. A worker per core just parks

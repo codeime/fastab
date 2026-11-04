@@ -6,14 +6,26 @@
 //! held 2.9 MB for the same work, and completions took no measurably longer.
 //!
 //! libmalloc reads the variable before `main`, so the process has to start with
-//! it. `LSEnvironment` would only cover launches through LaunchServices, and
-//! fterm is started by a shell, so the process replaces itself once instead.
+//! it. The app gets it from `LSEnvironment` in its Info.plist and clears it with
+//! [`clear_space_efficient`]. It must not replace itself: v0.0.24 did, and on
+//! macOS 27 its menu bar icon never appeared, though the same setting from
+//! `open --env` kept it. A launch that skips LaunchServices runs on the default
+//! allocator. fterm is started by a shell, so [`start_space_efficient`] replaces
+//! the process once; it has no status item to lose.
 
-const SPACE_EFFICIENT: &str = "MallocSpaceEfficient";
+pub const SPACE_EFFICIENT: &str = "MallocSpaceEfficient";
+
+/// Call first in `main`, before any thread starts. The setting has done its
+/// work by then, and the shells and generators the process starts should not
+/// inherit an allocator choice.
+pub fn clear_space_efficient() {
+    // SAFETY: the caller has started no thread yet, so nothing reads the
+    // environment concurrently.
+    unsafe { std::env::remove_var(SPACE_EFFICIENT) };
+}
 
 /// Call first in `main`, before any thread starts. Replaces the process with
-/// itself unless it already has the setting, and then clears the variable: the
-/// shells and generators it starts should not inherit an allocator choice. If
+/// itself unless it already has the setting, and then clears the variable. If
 /// the replacement fails, the process carries on with the default allocator.
 pub fn start_space_efficient() {
     #[cfg(target_os = "macos")]
@@ -21,9 +33,7 @@ pub fn start_space_efficient() {
         use std::os::unix::process::CommandExt;
 
         if std::env::var_os(SPACE_EFFICIENT).is_some() {
-            // SAFETY: the caller has started no thread yet, so nothing reads
-            // the environment concurrently.
-            unsafe { std::env::remove_var(SPACE_EFFICIENT) };
+            clear_space_efficient();
             return;
         }
         let Ok(executable) = std::env::current_exe() else {
