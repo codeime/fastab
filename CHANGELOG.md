@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.23
+
+- fix: a past command identical to what you typed no longer leads the list. With `git ch` in your shell history, typing `git ch` showed a `ch` row first, and accepting it inserted nothing.
+- change: the history index takes less memory. Reading a full shell history in v0.0.22 made it the largest item the completion engine keeps, estimated at 2.5 MB for 10,000 commands.
+
 ## v0.0.22
 
 - change: slow suggestions no longer hold up the list. A generator that took 80 ms or more last time now loads after the options and subcommands are shown.
