@@ -362,3 +362,35 @@ jobs:
           cargo run --locked --profile dist -p fastab_engine --example cold-load -- bundle/specs-ir | tee target/cold-load.txt
           table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/cold-load.txt)"
           echo "::notice title=cold completion (ms)::${table}"
+
+      # Which commit since v0.0.21 moved the engine's idle heap. The example is
+      # copied into each older tree, which predates it; they share one worktree
+      # and target directory, so each build only recompiles what changed.
+      - name: Compare engine memory across commits
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          set -o pipefail
+          mkdir -p target/ab
+          ab="$RUNNER_TEMP/engine-memory-ab"
+          builds=()
+          for entry in v0.0.21=c5f288a5d7ad760fd08786547ca0b5f8acd0b950 gen-spec=22ed7c702acdd68c154e4f001d2c511e468ed300 keep-specs=47d799d97b0b2cd0827f1fb9358a797d19ef9009 blocks=148075147b80924991271400edfb30ff28b9cb44 hash-threads=16bdae1f36e6d0bdb99d18f3138cd3ae93508b31 history-file=6083c6cf1dba16d2ada3c87e446ac3508556d63d; do
+            name="${entry%%=*}"
+            sha="${entry#*=}"
+            git fetch --quiet --no-tags --depth=1 origin "$sha"
+            if [ -d "$ab" ]; then
+              git -C "$ab" checkout --quiet --detach "$sha"
+            else
+              git worktree add --quiet --detach "$ab" "$sha"
+            fi
+            cp crates/fastab_engine/examples/engine-memory.rs "$ab/crates/fastab_engine/examples/"
+            (cd "$ab" && CARGO_TARGET_DIR="$GITHUB_WORKSPACE/target" cargo build --locked --profile dist -p fastab_engine --example engine-memory)
+            cp target/dist/examples/engine-memory "target/ab/$name"
+            builds+=("$name=target/ab/$name")
+          done
+          cargo build --locked --profile dist -p fastab_engine --example engine-memory
+          cp target/dist/examples/engine-memory target/ab/head
+          builds+=("head=target/ab/head" "head-no-history=target/ab/head,no-history")
+          python3 scripts/engine-memory-ab.py bundle/specs-ir "${builds[@]}" | tee target/engine-memory.txt
+          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/engine-memory.txt)"
+          echo "::notice title=engine memory (KiB)::${table}"
