@@ -1407,6 +1407,7 @@ fn figterm_main(command: Option<&[String]>) -> Result<()> {
 }
 
 fn main() {
+    fastab_util::malloc::start_space_efficient();
     // One fterm stays resident per terminal tab; it reads a few keys at
     // startup and writes a history row per command. No pool: no maintenance
     // thread, no 30 s reaper wakeup, and no SQLite connection open between uses.

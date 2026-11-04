@@ -1,4 +1,5 @@
 pub mod directories;
+pub mod malloc;
 pub mod manifest;
 mod open;
 #[cfg(target_os = "macos")]

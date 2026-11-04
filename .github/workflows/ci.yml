@@ -363,8 +363,8 @@ jobs:
           table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/cold-load.txt)"
           echo "::notice title=cold completion (ms)::${table}"
 
-      # Whether the engine's idle heap goes back to the system, and which work
-      # leaves it behind. Engine only, so the desktop's frameworks are not in it.
+      # What the engine leaves in the heap, with the allocator setting the desktop
+      # and fterm start with and without it. Engine only, so no frameworks.
       - name: Measure engine memory
         if: github.event_name == 'push' && github.ref == 'refs/heads/main'
         continue-on-error: true
@@ -372,23 +372,7 @@ jobs:
           set -o pipefail
           cargo build --locked --profile dist -p fastab_engine --example engine-memory
           probe=target/dist/examples/engine-memory
-          python3 scripts/engine-memory-ab.py bundle/specs-ir "head=$probe" "no-history=$probe,no-history" \
-            "space-efficient=$probe,MallocSpaceEfficient=1" \
+          python3 scripts/engine-memory-ab.py bundle/specs-ir "default=$probe" "space-efficient=$probe,MallocSpaceEfficient=1" \
             | tee target/engine-memory.txt
           table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/engine-memory.txt)"
           echo "::notice title=engine memory (KiB)::${table}"
-          # What that allocator setting costs in time, and whether fterm gains.
-          for round in 1 2 3; do
-            echo "--- default, round $round"
-            target/dist/examples/cold-load bundle/specs-ir | grep -E '^(first request|"|git )'
-            echo "--- MallocSpaceEfficient=1, round $round"
-            MallocSpaceEfficient=1 target/dist/examples/cold-load bundle/specs-ir | grep -E '^(first request|"|git )'
-          done | tee target/space-efficient.txt
-          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/space-efficient.txt)"
-          echo "::notice title=space-efficient latency (ms)::${table}"
-          for size in 40x120 60x240; do
-            python3 scripts/fterm-footprint-ab.py --rounds 5 --size "$size" default=target/dist/fterm
-            MallocSpaceEfficient=1 python3 scripts/fterm-footprint-ab.py --rounds 5 --size "$size" space-efficient=target/dist/fterm
-          done | tee target/fterm-space-efficient.txt
-          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/fterm-space-efficient.txt)"
-          echo "::notice title=fterm space-efficient (KiB)::${table}"
