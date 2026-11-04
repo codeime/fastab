@@ -252,6 +252,24 @@ impl History {
         Ok(rows_mapped)
     }
 
+    /// The newest row's id, or 0 for an empty table.
+    pub fn latest_id(&self) -> Result<i64> {
+        let conn = self.conn()?;
+        Ok(conn.query_row("SELECT COALESCE(MAX(id), 0) FROM history", [], |row| row.get(0))?)
+    }
+
+    /// Rows inserted after row `id`, oldest first, each with its id.
+    pub fn command_rows_after(&self, id: i64, limit: usize) -> Result<Vec<(i64, HistoryCommand)>> {
+        let conn = self.conn()?;
+        let mut stmt =
+            conn.prepare("SELECT command, shell, start_time, id FROM history WHERE id > ? ORDER BY id ASC LIMIT ?")?;
+        let rows = stmt.query(params![id, limit])?;
+        let rows_mapped = rows
+            .mapped(|row| Ok((row.get::<_, i64>(3)?, map_command_row(row)?)))
+            .collect::<rusqlite::Result<Vec<(i64, HistoryCommand)>>>()?;
+        Ok(rows_mapped)
+    }
+
     /// A raw sql query that returns a json array of objects
     pub fn query<P: rusqlite::Params>(
         &self,
@@ -448,6 +466,33 @@ mod tests {
     #[test]
     fn history_new_test() {
         let _ = History::new();
+    }
+
+    #[test]
+    fn rows_after_an_id_come_oldest_first() {
+        let history = History::mock();
+        assert_eq!(history.latest_id().unwrap(), 0);
+        for command in ["one", "two", "three"] {
+            history
+                .insert_command_history(
+                    &CommandInfo {
+                        command: Some(command.into()),
+                        ..CommandInfo::default()
+                    },
+                    false,
+                )
+                .unwrap();
+        }
+        let latest = history.latest_id().unwrap();
+        let commands = |rows: Vec<(i64, HistoryCommand)>| -> Vec<String> {
+            rows.into_iter().filter_map(|(_, row)| row.command).collect()
+        };
+        assert_eq!(
+            commands(history.command_rows_after(latest - 2, 10).unwrap()),
+            ["two", "three"]
+        );
+        assert_eq!(commands(history.command_rows_after(0, 1).unwrap()), ["one"]);
+        assert!(history.command_rows_after(latest, 10).unwrap().is_empty());
     }
 
     #[test]

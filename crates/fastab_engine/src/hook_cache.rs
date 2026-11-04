@@ -27,9 +27,15 @@ const MAX_CACHE_BYTES: usize = 4 * 1024 * 1024;
 /// command typed after a pause (24 ms and ~100 ms on CI). A map over this
 /// estimate is cleared like the generator maps.
 const IDLE_SPEC_CACHE_BYTES: usize = 256 * 1024;
+/// How long a generated spec answers before its `generateSpec` runs again.
+/// These specs read the project and the machine (package.json scripts, git
+/// aliases, cargo plugins), and the app runs for days, where keeping them for
+/// the session would hide a new script until a restart.
+const GENERATED_SPEC_TTL: Duration = Duration::from_secs(5 * 60);
 
 thread_local! {
     static CURRENT: std::cell::RefCell<Option<Arc<HookCache>>> = const { std::cell::RefCell::new(None) };
+    static GENERATOR_HITS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
 }
 
 #[derive(Clone)]
@@ -182,7 +188,7 @@ pub struct HookCache {
     /// re-applies `splitOn` / `postProcess` on every hit, so the hook still
     /// sees the current tokens; caching rows here would freeze them.
     script_output_cache: Mutex<CacheMap<CacheEntry<String>>>,
-    spec_cache: Mutex<CacheMap<Spec>>,
+    spec_cache: Mutex<CacheMap<CacheEntry<Spec>>>,
 }
 
 impl Default for HookCache {
@@ -429,6 +435,7 @@ fn run_cached<T: Clone + Default + CachePayload>(
     );
     let lookup = CachePolicy { ttl: policy.ttl };
     if let Some(hit) = cache_get(cache, &key, lookup) {
+        GENERATOR_HITS.with(|hits| hits.set(hits.get() + 1));
         return hit;
     }
     if crate::cancellation::is_cancelled() {
@@ -440,6 +447,12 @@ fn run_cached<T: Clone + Default + CachePayload>(
     }
     cache_put(cache, key, value.clone());
     value
+}
+
+/// Generator lookups this thread answered from the cache. A change across a
+/// run means the run's duration says nothing about the generator's speed.
+pub(crate) fn generator_cache_hits() -> u64 {
+    GENERATOR_HITS.with(std::cell::Cell::get)
 }
 
 pub fn cached_suggestions(
@@ -473,17 +486,10 @@ pub fn cached_spec(cache_key: &str, run: impl FnOnce() -> Option<Spec>) -> Optio
     let Some(cache) = current() else {
         return run();
     };
-    let hit = crate::cancellation::commit_if_active(|| {
-        let mut map = cache.spec_cache.lock().unwrap_or_else(|err| err.into_inner());
-        if let Some(spec) = map.entries.get(cache_key).cloned() {
-            map.counters.hits = map.counters.hits.saturating_add(1);
-            return Some(spec);
-        }
-        map.counters.misses = map.counters.misses.saturating_add(1);
-        None
-    })
-    .ok()?;
-    if let Some(spec) = hit {
+    let lookup = CachePolicy {
+        ttl: Some(GENERATED_SPEC_TTL),
+    };
+    if let Some(spec) = cache_get(&cache.spec_cache, cache_key, lookup) {
         return Some(spec);
     }
     crate::cancellation::check().ok()?;
@@ -492,7 +498,13 @@ pub fn cached_spec(cache_key: &str, run: impl FnOnce() -> Option<Spec>) -> Optio
     let key = cache_key.to_owned();
     crate::cancellation::commit_if_active(|| {
         let mut map = cache.spec_cache.lock().unwrap_or_else(|err| err.into_inner());
-        map.insert(key, cached);
+        map.insert(
+            key,
+            CacheEntry {
+                value: cached,
+                fetched_at: Instant::now(),
+            },
+        );
     })
     .ok()?;
     Some(value)
@@ -501,6 +513,34 @@ pub fn cached_spec(cache_key: &str, run: impl FnOnce() -> Option<Spec>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn generated_specs_run_again_once_they_expire() {
+        let cache = HookCache::new();
+        let _bound = cache.bind();
+        let spec = || {
+            Some(Spec {
+                description: "demo".into(),
+                ..Spec::default()
+            })
+        };
+        assert!(cached_spec("key", spec).is_some());
+        assert!(cached_spec("key", || panic!("a fresh entry answers")).is_some());
+        cache
+            .spec_cache
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .entries
+            .get_mut("key")
+            .unwrap()
+            .fetched_at -= GENERATED_SPEC_TTL + Duration::from_secs(1);
+        let mut ran = false;
+        let again = cached_spec("key", || {
+            ran = true;
+            spec()
+        });
+        assert!(ran && again.is_some());
+    }
 
     #[test]
     fn cancellation_during_generation_cannot_publish_cache_entries() {
@@ -566,12 +606,18 @@ mod tests {
             description: "demo".into(),
             ..Spec::default()
         };
-        let expected = std::mem::size_of::<String>() + "tool-spec".len() + spec.allocated_bytes();
-        cache
-            .spec_cache
-            .lock()
-            .unwrap_or_else(|err| err.into_inner())
-            .insert("tool-spec".into(), spec);
+        let expected = std::mem::size_of::<String>()
+            + "tool-spec".len()
+            + std::mem::size_of::<CacheEntry<Spec>>()
+            + spec.allocated_bytes()
+            - std::mem::size_of::<Spec>();
+        cache.spec_cache.lock().unwrap_or_else(|err| err.into_inner()).insert(
+            "tool-spec".into(),
+            CacheEntry {
+                value: spec,
+                fetched_at: Instant::now(),
+            },
+        );
         assert_eq!(cache.allocated_bytes(), expected);
         cache.clear();
         assert_eq!(cache.allocated_bytes(), 0);

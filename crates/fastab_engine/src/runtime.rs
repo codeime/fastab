@@ -31,6 +31,9 @@ fn should_merge_history(include_history: bool, disabled: bool) -> bool {
     include_history && history_loading_enabled(disabled)
 }
 
+/// How often a stream of requests looks for commands that finished since.
+const HISTORY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompleteRequest {
     /// Desktop-only opt-in. Never enabled by serialized CLI/protocol input.
@@ -368,6 +371,9 @@ pub struct Engine {
     acceptance: Arc<Mutex<rank::AcceptanceIndex>>,
     frecency_loaded: bool,
     history_source: Option<rank::HistorySourceConfig>,
+    /// The database row new commands are read after; `None` follows nothing.
+    history_database_row: Option<i64>,
+    history_checked_at: std::time::Instant,
     /// Spec-aware `template: "history"` index over the frecency lines. Rebuilt
     /// only when the loaded history changes; requests share it by `Arc`.
     history: Arc<crate::history::HistoryStore>,
@@ -434,6 +440,8 @@ impl Engine {
             acceptance,
             frecency_loaded: false,
             history_source: None,
+            history_database_row: None,
+            history_checked_at: std::time::Instant::now(),
             history: Arc::default(),
             generator_session: crate::generate::GeneratorSession::default(),
             hook_cache_active: false,
@@ -733,8 +741,12 @@ impl Engine {
             &request.environment_variables,
         );
         if self.frecency_loaded && self.history_source.as_ref() == Some(&source) {
+            self.append_new_history(&source);
             return;
         }
+        // Read before the load: a command that finishes during it may count
+        // twice, but cannot be missed.
+        let database_row = rank::database_cursor(&source);
         let commands = rank::load_commands_for(&source);
         if crate::cancellation::is_cancelled() {
             return;
@@ -746,6 +758,35 @@ impl Engine {
             self.frecency = frecency;
             self.frecency_loaded = true;
             self.history_source = Some(source);
+            self.history_database_row = database_row;
+            self.history_checked_at = std::time::Instant::now();
+        });
+    }
+
+    /// The app runs for days and history loads once, so follow the row fterm
+    /// writes after each command. A primary-key read, at most every
+    /// [`HISTORY_CHECK_INTERVAL`] and only while requests arrive.
+    fn append_new_history(&mut self, source: &rank::HistorySourceConfig) {
+        let Some(after) = self.history_database_row else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        if now.saturating_duration_since(self.history_checked_at) < HISTORY_CHECK_INTERVAL {
+            return;
+        }
+        self.history_checked_at = now;
+        let Some((commands, last)) = rank::new_database_commands(source, after) else {
+            return;
+        };
+        if last == after {
+            return;
+        }
+        let _ = crate::cancellation::commit_if_active(|| {
+            self.frecency.append_commands(commands);
+            self.history_database_row = Some(last);
+            if self.frecency.command_lines().len() > rank::MAX_LOADED_HISTORY_COMMANDS {
+                self.frecency_loaded = false;
+            }
         });
     }
 

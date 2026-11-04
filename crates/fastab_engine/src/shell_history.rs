@@ -13,6 +13,7 @@
 use std::collections::HashSet;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use crate::rank::HistoryShell;
 
@@ -36,9 +37,9 @@ pub(crate) struct HistoryFiles {
 
 impl HistoryFiles {
     /// Files for the current shell, plus zsh and bash when `merge_zsh_bash`
-    /// is set. An exported `HISTFILE` belongs to the current shell; otherwise
-    /// each shell's default applies: `${ZDOTDIR:-$HOME}/.zsh_history` (what
-    /// macOS's `/etc/zshrc` sets), `~/.bash_history`, and
+    /// is set. An exported `HISTFILE` belongs to a current zsh or bash;
+    /// otherwise each shell's default applies: `${ZDOTDIR:-$HOME}/.zsh_history`
+    /// (what macOS's `/etc/zshrc` sets), `~/.bash_history`, and
     /// `${XDG_DATA_HOME:-~/.local/share}/fish/fish_history`.
     pub(crate) fn resolve(current: HistoryShell, merge_zsh_bash: bool, environment: &[(String, String)]) -> Self {
         let var = |name: &str| {
@@ -56,29 +57,29 @@ impl HistoryFiles {
         let reads = |shell: HistoryShell| {
             shell == current || (merge_zsh_bash && matches!(shell, HistoryShell::Zsh | HistoryShell::Bash))
         };
-        let file = |shell: HistoryShell, default: Option<PathBuf>| {
-            if !reads(shell) {
-                None
-            } else if shell == current {
-                var("HISTFILE").or(default)
-            } else {
-                default
-            }
-        };
+        let histfile = |shell: HistoryShell| if shell == current { var("HISTFILE") } else { None };
         Self {
-            zsh: file(
-                HistoryShell::Zsh,
-                var("ZDOTDIR")
-                    .or_else(|| home.clone())
-                    .map(|dir| dir.join(".zsh_history")),
-            ),
-            bash: file(HistoryShell::Bash, home.as_ref().map(|dir| dir.join(".bash_history"))),
-            fish: file(
-                HistoryShell::Fish,
-                var("XDG_DATA_HOME")
-                    .or_else(|| home.as_ref().map(|dir| dir.join(".local/share")))
-                    .map(|dir| dir.join("fish/fish_history")),
-            ),
+            zsh: reads(HistoryShell::Zsh)
+                .then(|| {
+                    histfile(HistoryShell::Zsh).or_else(|| {
+                        var("ZDOTDIR")
+                            .or_else(|| home.clone())
+                            .map(|dir| dir.join(".zsh_history"))
+                    })
+                })
+                .flatten(),
+            bash: reads(HistoryShell::Bash)
+                .then(|| histfile(HistoryShell::Bash).or_else(|| home.as_ref().map(|dir| dir.join(".bash_history"))))
+                .flatten(),
+            // fish keeps its own file and ignores `HISTFILE`, which it may
+            // have inherited from a shell that started it.
+            fish: reads(HistoryShell::Fish)
+                .then(|| {
+                    var("XDG_DATA_HOME")
+                        .or_else(|| home.as_ref().map(|dir| dir.join(".local/share")))
+                        .map(|dir| dir.join("fish/fish_history"))
+                })
+                .flatten(),
         }
     }
 
@@ -111,6 +112,12 @@ pub(crate) fn commands(files: &HistoryFiles, shell: HistoryShell, limit: usize) 
         rows.drain(..rows.len() - limit);
     }
     rows
+}
+
+/// When `shell`'s history file last changed. Commands that started later are
+/// not in it yet: zsh and bash write it when a shell exits by default.
+pub(crate) fn modified(files: &HistoryFiles, shell: HistoryShell) -> Option<SystemTime> {
+    std::fs::metadata(files.path(shell)?).ok()?.modified().ok()
 }
 
 /// The last `max` bytes of a regular file, and whether anything before them
@@ -399,6 +406,14 @@ mod tests {
         let relative = env(&[("HOME", "/home/u"), ("HISTFILE", "history")]);
         let bash = HistoryFiles::resolve(HistoryShell::Bash, false, &relative);
         assert_eq!(bash.bash.as_deref(), Some(Path::new("/home/u/.bash_history")));
+
+        // fish ignores a HISTFILE it inherited.
+        let inherited = env(&[("HOME", "/home/u"), ("HISTFILE", "/home/u/.zsh_history")]);
+        let fish = HistoryFiles::resolve(HistoryShell::Fish, false, &inherited);
+        assert_eq!(
+            fish.fish.as_deref(),
+            Some(Path::new("/home/u/.local/share/fish/fish_history"))
+        );
 
         let fish = HistoryFiles::resolve(HistoryShell::Fish, true, &home);
         assert_eq!(

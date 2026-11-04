@@ -323,6 +323,20 @@ impl Frecency {
         })
     }
 
+    /// Commands that finished after this list was built. The history store
+    /// keeps the old list until the next request rebinds it.
+    pub(crate) fn append_commands(&mut self, commands: impl IntoIterator<Item = String>) {
+        let lines = Arc::make_mut(&mut self.lines);
+        for command in commands {
+            let command = command.trim();
+            if command.is_empty() {
+                continue;
+            }
+            let _ = self.next_words.record(command, &mut || Ok(()));
+            lines.push(Arc::from(command));
+        }
+    }
+
     pub(crate) fn command_lines(&self) -> Arc<Vec<Arc<str>>> {
         Arc::clone(&self.lines)
     }
@@ -1130,8 +1144,9 @@ pub fn load_commands() -> Vec<(String, u64)> {
 /// failure, timeout, or empty output falls back to the local history
 /// database, both capped at the recent window. Without a custom command,
 /// known shells read their own history files (the current shell's, or
-/// zsh+bash when `allShells` is enabled) and fall back to the database rows
-/// of those shells; unknown shells use the database source.
+/// zsh+bash when `allShells` is enabled), plus the database rows newer than
+/// each file, and fall back to the database rows of those shells; unknown
+/// shells use the database source.
 pub(crate) fn load_commands_for(config: &HistorySourceConfig) -> Vec<(String, u64)> {
     if let Some(command) = config.custom_command.as_deref() {
         if let Some(commands) = run_custom_history(command) {
@@ -1143,7 +1158,16 @@ pub(crate) fn load_commands_for(config: &HistorySourceConfig) -> Vec<(String, u6
     let mut from_shell = Vec::new();
     let mut read = |shell| {
         let commands = crate::shell_history::commands(&config.files, shell, MAX_DATABASE_HISTORY_COMMANDS);
+        if commands.is_empty() {
+            return;
+        }
         from_shell.extend(commands.into_iter().map(|command| (command, 0)));
+        let written = crate::shell_history::modified(&config.files, shell);
+        from_shell.extend(unflushed_database_commands(
+            &fastab_settings::history::History::new(),
+            shell,
+            written,
+        ));
     };
     match config.current_shell {
         HistoryShell::Zsh | HistoryShell::Bash | HistoryShell::Fish => read(config.current_shell),
@@ -1165,6 +1189,62 @@ pub(crate) fn load_commands_for(config: &HistorySourceConfig) -> Vec<(String, u6
     } else {
         from_shell
     }
+}
+
+/// Commands of `shell` that started after its history file was last written.
+/// zsh and bash write the file when a shell exits by default, so those of a
+/// shell still open are only in the database fterm writes after each command.
+fn unflushed_database_commands(
+    history: &fastab_settings::history::History,
+    shell: HistoryShell,
+    written: Option<SystemTime>,
+) -> Vec<(String, u64)> {
+    use fastab_settings::history::{HistoryColumn, Order, OrderBy};
+    let Some(written) = written else {
+        return Vec::new();
+    };
+    let mut rows = history
+        .command_rows(
+            vec![OrderBy::new(HistoryColumn::Id, Order::Desc)],
+            MAX_NEW_DATABASE_ROWS,
+            0,
+        )
+        .unwrap_or_default();
+    rows.reverse();
+    rows.into_iter()
+        .filter(|row| normalize_history_shell(row.shell.as_deref()) == shell)
+        .filter(|row| row.start_time.is_some_and(|started| started > written))
+        .filter_map(|row| Some((non_empty_history_command(row.command.as_deref()?)?, 0)))
+        .collect()
+}
+
+/// The database row new commands are read after, for a source that follows
+/// the database. A custom history command replaces it.
+pub(crate) fn database_cursor(config: &HistorySourceConfig) -> Option<i64> {
+    if config.custom_command.is_some() {
+        return None;
+    }
+    fastab_settings::history::History::new().latest_id().ok()
+}
+
+/// Commands fterm recorded after row `after`, and the row to continue from.
+pub(crate) fn new_database_commands(config: &HistorySourceConfig, after: i64) -> Option<(Vec<String>, i64)> {
+    new_commands_from(&fastab_settings::history::History::new(), config, after)
+}
+
+fn new_commands_from(
+    history: &fastab_settings::history::History,
+    config: &HistorySourceConfig,
+    after: i64,
+) -> Option<(Vec<String>, i64)> {
+    let rows = history.command_rows_after(after, MAX_NEW_DATABASE_ROWS).ok()?;
+    let last = rows.last().map_or(after, |(id, _)| *id);
+    let commands = rows
+        .into_iter()
+        .filter(|(_, row)| includes_database_shell(config, normalize_history_shell(row.shell.as_deref())))
+        .filter_map(|(_, row)| non_empty_history_command(row.command.as_deref()?))
+        .collect();
+    Some((commands, last))
 }
 
 fn includes_database_shell(config: &HistorySourceConfig, row_shell: HistoryShell) -> bool {
@@ -1202,6 +1282,10 @@ fn history_commands_from_output(output: &str) -> Vec<(String, u64)> {
 /// lifetime size of the history database and with `fc` / `history` output.
 /// Recent commands are the only ones frecency meaningfully weights anyway.
 const MAX_DATABASE_HISTORY_COMMANDS: usize = 10_000;
+/// Rows read at once when following the database.
+const MAX_NEW_DATABASE_ROWS: usize = 1_000;
+/// Loaded plus appended commands before a reload trims them to the recent window.
+pub(crate) const MAX_LOADED_HISTORY_COMMANDS: usize = 2 * MAX_DATABASE_HISTORY_COMMANDS;
 
 fn load_database_commands<F>(include: F) -> Vec<(String, u64)>
 where
@@ -2108,6 +2192,63 @@ mod tests {
             .map(|(command, _)| command)
             .collect();
         assert_eq!(merged, vec!["ls", "git status", "cargo build"]);
+    }
+
+    fn insert_history(history: &fastab_settings::history::History, shell: &str, command: &str, started: u64) {
+        history
+            .insert_command_history(
+                &fastab_settings::history::CommandInfo {
+                    command: Some(command.into()),
+                    shell: Some(shell.into()),
+                    start_time: Some(UNIX_EPOCH + Duration::from_secs(started)),
+                    ..fastab_settings::history::CommandInfo::default()
+                },
+                false,
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn new_database_rows_follow_the_cursor_and_the_source_shell() {
+        let history = fastab_settings::history::History::mock();
+        insert_history(&history, "zsh", "git status", 1);
+        insert_history(&history, "bash", "ls", 2);
+        insert_history(&history, "/bin/zsh", "cargo build", 3);
+        let zsh = history_source_config(None, false, Some("zsh"), None, &[]);
+        let (commands, last) = new_commands_from(&history, &zsh, 0).unwrap();
+        assert_eq!(commands, ["git status", "cargo build"]);
+        assert_eq!(last, history.latest_id().unwrap());
+        assert_eq!(new_commands_from(&history, &zsh, last).unwrap(), (Vec::new(), last));
+        // A row the source filters out still moves the cursor past it.
+        insert_history(&history, "bash", "pwd", 4);
+        let (commands, moved) = new_commands_from(&history, &zsh, last).unwrap();
+        assert!(commands.is_empty());
+        assert!(moved > last);
+    }
+
+    #[test]
+    fn unflushed_rows_are_those_newer_than_the_history_file() {
+        let history = fastab_settings::history::History::mock();
+        insert_history(&history, "zsh", "in the file", 100);
+        insert_history(&history, "bash", "another shell", 300);
+        insert_history(&history, "zsh", "still open", 200);
+        let written = Some(UNIX_EPOCH + Duration::from_secs(150));
+        assert_eq!(
+            unflushed_database_commands(&history, HistoryShell::Zsh, written),
+            vec![("still open".to_string(), 0)]
+        );
+        assert!(unflushed_database_commands(&history, HistoryShell::Zsh, None).is_empty());
+    }
+
+    #[test]
+    fn appended_commands_reach_history_and_counts_without_touching_the_old_list() {
+        let mut frecency = Frecency::from_commands([("git status".to_string(), 1)]);
+        let before = frecency.command_lines();
+        frecency.append_commands(["git commit".to_string(), "  ".to_string()]);
+        assert_eq!(before.len(), 1);
+        assert_eq!(frecency.command_lines().len(), 2);
+        assert_eq!(frecency.next_word_counts("git").get("commit"), Some(&1));
+        assert_eq!(frecency.next_word_counts("git").get("status"), Some(&1));
     }
 
     #[test]

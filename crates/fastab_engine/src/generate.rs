@@ -200,16 +200,16 @@ fn generator_is_known_slow(key: &str) -> bool {
         .contains(key)
 }
 
-/// Remember how the last run went. A run cancelled early says nothing about
-/// speed, but one cancelled after the budget had already passed was slow.
-fn note_generator_speed(key: String, elapsed: Duration, cancelled: bool) {
+/// Remember how the last run went. A run cancelled early or answered from the
+/// cache says nothing about speed, but one that passed the budget was slow.
+fn note_generator_speed(key: String, elapsed: Duration, inconclusive: bool) {
     let mut slow = SLOW_GENERATORS.lock().unwrap_or_else(|error| error.into_inner());
     if elapsed >= SLOW_GENERATOR {
         if slow.len() >= MAX_SLOW_GENERATORS && !slow.contains(&key) {
             slow.clear();
         }
         slow.insert(key);
-    } else if !cancelled {
+    } else if !inconclusive {
         slow.remove(&key);
     }
 }
@@ -429,14 +429,17 @@ pub(crate) fn generate_for_arg_with_history(
             if crate::cancellation::is_cancelled() {
                 return;
             }
-            let trigger = should_trigger(
-                generator.trigger.as_ref(),
-                debounce,
-                arg_changed || !session.entries[index].ran,
-                &normalized_search_term,
-                &previous,
-                generator_lists_paths(generator, arg),
-            );
+            // A deferred run stays owed: a keystroke that lands before its
+            // follow-up, and does not trigger by itself, must not drop it.
+            let trigger = session.entries[index].needs_run
+                || should_trigger(
+                    generator.trigger.as_ref(),
+                    debounce,
+                    arg_changed || !session.entries[index].ran,
+                    &normalized_search_term,
+                    &previous,
+                    generator_lists_paths(generator, arg),
+                );
             // getQueryTerm tail for filtering returned names. Custom hooks
             // receive the parser token's inner text, not the raw shell token.
             let gen_query = query_term_with_hook(
@@ -479,6 +482,7 @@ pub(crate) fn generate_for_arg_with_history(
                 refilter_generated(&session.entries[index].results, &gen_query, fuzzy)
             } else {
                 let started = Instant::now();
+                let cache_hits = crate::hook_cache::generator_cache_hits();
                 let mut rows = generate_from_generator(
                     arg,
                     generator,
@@ -492,7 +496,8 @@ pub(crate) fn generate_for_arg_with_history(
                 );
                 let cancelled = crate::cancellation::is_cancelled();
                 if let Some(key) = speed_key {
-                    note_generator_speed(key, started.elapsed(), cancelled);
+                    let inconclusive = cancelled || crate::hook_cache::generator_cache_hits() != cache_hits;
+                    note_generator_speed(key, started.elapsed(), inconclusive);
                 }
                 if cancelled {
                     return;
@@ -2297,6 +2302,69 @@ mod tests {
         let (names, pending) = run_slot(&arg, "two", &cwd);
         assert_eq!(names, vec!["alpha", "beta"]);
         assert_eq!(pending, (false, None));
+        set_defer_slow_generators(false);
+        install_session(GeneratorSession::default());
+    }
+
+    #[test]
+    fn a_cached_answer_keeps_a_generator_marked_slow() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        let arg = ArgSpec {
+            cache_ttl_ms: Some(60_000),
+            ..slow_script_arg("slow-cached")
+        };
+        let cache = crate::hook_cache::HookCache::new();
+        let _bound = cache.bind();
+        set_defer_slow_generators(true);
+        install_session(GeneratorSession::default());
+        assert_eq!(run_slot(&arg, "one", &cwd).1, (false, None));
+        assert_eq!(run_slot(&arg, "two", &cwd).1, (true, Some(0)));
+        // The follow-up is a cache hit: fast, but no evidence of a fast generator.
+        let (names, pending) = run_slot(&arg, "two", &cwd);
+        assert_eq!(names, vec!["alpha", "beta"]);
+        assert_eq!(pending, (false, None));
+        assert_eq!(run_slot(&arg, "three", &cwd).1, (true, Some(0)));
+        set_defer_slow_generators(false);
+        install_session(GeneratorSession::default());
+    }
+
+    #[test]
+    fn a_deferred_run_survives_a_keystroke_that_does_not_trigger() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = dir.path().display().to_string();
+        let arg = ArgSpec {
+            name: "slow-trigger".into(),
+            generators: vec![GeneratorSpec {
+                script: vec!["sh".into(), "-c".into(), "sleep 0.1; printf 'alpha\\nbeta\\n'".into()],
+                split_on: Some("\n".into()),
+                get_query_term: Some("/".into()),
+                trigger: Some(GeneratorTrigger {
+                    on: "string".into(),
+                    string: Some(serde_json::json!("/")),
+                    length: None,
+                    js_trigger: None,
+                }),
+                ..GeneratorSpec::default()
+            }],
+            ..ArgSpec::default()
+        };
+        let run = |term: &str| {
+            let tokens = vec!["tool".to_string(), term.to_string()];
+            let rows = generate_for_arg_with_search_term(&arg, &tokens, term, term, &cwd, false);
+            (
+                rows.into_iter().map(|row| row.name).collect::<Vec<_>>(),
+                take_pending_generators(),
+            )
+        };
+        set_defer_slow_generators(true);
+        install_session(GeneratorSession::default());
+        assert_eq!(run("foo/").1, (false, None));
+        // The `/` moved and the generator is known to be slow.
+        assert_eq!(run("foo/bar/"), (Vec::new(), (true, Some(0))));
+        // This keystroke would not trigger, but the run above is still owed.
+        assert_eq!(run("foo/bar/b"), (Vec::new(), (true, Some(0))));
+        assert_eq!(run("foo/bar/b"), (vec!["beta".to_string()], (false, None)));
         set_defer_slow_generators(false);
         install_session(GeneratorSession::default());
     }
