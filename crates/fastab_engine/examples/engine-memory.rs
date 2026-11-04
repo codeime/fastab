@@ -7,7 +7,9 @@
 //! directory holding a 10,000-command `.zsh_history` (empty with
 //! `--no-history`), one keystroke at a time, with the engine retiring its caches
 //! between bursts as it does after input ends. Prints `phase footprint in_use
-//! allocated` in bytes per line; `scripts/engine-memory-ab.py` compares builds.
+//! allocated` in bytes per line, with a `step:<command>` phase after each
+//! command of the first burst and `released <bytes>` for the pressure relief;
+//! `scripts/engine-memory-ab.py` compares builds and allocator settings.
 //! Generator rows run real commands in the current directory.
 
 use std::ffi::c_void;
@@ -21,6 +23,7 @@ use fastab_engine::{CompleteRequest, EngineClient, EngineClientOptions, SessionI
 
 const GRACE: Duration = Duration::from_millis(100);
 const BURSTS: usize = 6;
+const SETTLE: Duration = Duration::from_secs(20);
 const HISTORY_COMMANDS: usize = 10_000;
 const COMMANDS: &[&str] = &[
     "git checkout ",
@@ -119,6 +122,9 @@ fn main() -> anyhow::Result<()> {
             for end in 1..=command.len() {
                 complete(&command[..end])?;
             }
+            if burst == 0 {
+                sample(&format!("step:{}", command.trim_end().replace(' ', "_")));
+            }
         }
         if burst + 1 == BURSTS {
             sample("busy");
@@ -129,11 +135,13 @@ fn main() -> anyhow::Result<()> {
     sample("idle");
     // As the desktop's heap_trim does once the app goes quiet.
     // SAFETY: a null zone means every zone; no pointer is retained.
-    unsafe {
-        malloc_zone_pressure_relief(std::ptr::null_mut(), 0);
-    }
+    let released = unsafe { malloc_zone_pressure_relief(std::ptr::null_mut(), 0) };
+    println!("released {released}");
     std::thread::sleep(GRACE * 2);
     sample("relieved");
+    // The allocator may hand pages back later than the relief call returns.
+    std::thread::sleep(SETTLE);
+    sample("settled");
     Ok(())
 }
 
