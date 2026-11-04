@@ -2435,7 +2435,7 @@ mod tests {
             frecency
                 .next_word_counts(&format!("echo {}", " ".repeat(4095)))
                 .get(&word),
-            Some(&1)
+            Some(1)
         );
         assert_eq!(frecency.next_words.words.len(), 2);
         assert!(frecency.next_words_diagnostics().2 < command.len() * 64);
