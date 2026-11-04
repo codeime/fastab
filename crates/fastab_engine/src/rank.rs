@@ -251,33 +251,51 @@ struct NextWords {
     // Node indices make both destruction and diagnostics iterative, even for
     // a history line with tens of thousands of tokens.
     nodes: Vec<WordNode>,
-    words: HashMap<String, usize>,
+    words: HashMap<Box<str>, u32>,
 }
 
 #[derive(Debug, Clone, Default)]
 struct WordNode {
     // Edges split only at ASCII spaces, retaining empty segments, tabs and
-    // Unicode whitespace verbatim instead of copying each full prefix.
-    children: HashMap<String, usize>,
-    counts: HashMap<usize, usize>,
+    // Unicode whitespace verbatim instead of copying each full prefix. Sorted,
+    // as `counts` is by word id: a 10,000-command history has thousands of
+    // nodes, nearly all with an entry or two, and this lives as long as the app.
+    children: Vec<(Box<str>, u32)>,
+    counts: Vec<(u32, u32)>,
+}
+
+impl WordNode {
+    fn count(&mut self, word: u32) {
+        match self.counts.binary_search_by_key(&word, |(id, _)| *id) {
+            Ok(index) => self.counts[index].1 += 1,
+            Err(index) => self.counts.insert(index, (word, 1)),
+        }
+    }
+
+    fn child_position(&self, segment: &str) -> Result<usize, usize> {
+        self.children.binary_search_by(|(edge, _)| (**edge).cmp(segment))
+    }
 }
 
 #[derive(Clone, Copy)]
 struct NextWordCounts<'a> {
-    words: &'a HashMap<String, usize>,
-    counts: Option<&'a HashMap<usize, usize>>,
+    words: &'a HashMap<Box<str>, u32>,
+    counts: Option<&'a [(u32, u32)]>,
 }
 
 impl NextWordCounts<'_> {
-    fn get(&self, word: &str) -> Option<&usize> {
-        self.counts?.get(self.words.get(word)?)
+    fn get(&self, word: &str) -> Option<usize> {
+        let id = *self.words.get(word)?;
+        let counts = self.counts?;
+        let index = counts.binary_search_by_key(&id, |(id, _)| *id).ok()?;
+        Some(counts[index].1 as usize)
     }
 
     #[cfg(test)]
     fn to_owned_map(self) -> HashMap<String, usize> {
         self.words
-            .iter()
-            .filter_map(|(word, id)| self.counts?.get(id).map(|count| (word.clone(), *count)))
+            .keys()
+            .filter_map(|word| self.get(word).map(|count| (word.to_string(), count)))
             .collect()
     }
 }
@@ -317,6 +335,7 @@ impl Frecency {
             lines.push(line);
         }
         check()?;
+        next_words.shrink();
         Ok(Self {
             lines: Arc::new(lines),
             next_words,
@@ -365,7 +384,6 @@ impl Frecency {
             .map(|command| {
                 let priority = first_word_counts
                     .get(command.split_whitespace().next().unwrap_or_default())
-                    .copied()
                     .map_or(50, history_priority_base);
                 Suggestion::new(command, "past command", "history")
                     .with_insert_value(command)
@@ -398,10 +416,7 @@ impl Frecency {
             .take(HISTORY_LIMIT)
             .map(|suffix| {
                 let first_word = suffix.split_whitespace().next().unwrap_or_default();
-                let priority = first_word_counts
-                    .get(first_word)
-                    .copied()
-                    .map_or(50, history_priority_base);
+                let priority = first_word_counts.get(first_word).map_or(50, history_priority_base);
                 Suggestion::new(suffix.clone(), "past command", "history")
                     .with_insert_value(suffix)
                     .with_priority(priority)
@@ -425,35 +440,49 @@ impl NextWords {
         };
         if !prefix.is_empty() {
             for segment in prefix.split(' ') {
-                match node.children.get(segment) {
-                    Some(child) => node = &self.nodes[*child],
-                    None => return missing,
+                match node.child_position(segment) {
+                    Ok(index) => node = &self.nodes[node.children[index].1 as usize],
+                    Err(_) => return missing,
                 }
             }
         }
         NextWordCounts {
             words: &self.words,
-            counts: Some(&node.counts),
+            counts: Some(node.counts.as_slice()),
         }
     }
 
-    fn word_id(&mut self, word: &str) -> usize {
+    fn word_id(&mut self, word: &str) -> u32 {
         if let Some(id) = self.words.get(word) {
             return *id;
         }
-        let id = self.words.len();
-        self.words.insert(word.to_string(), id);
+        let id = self.words.len() as u32;
+        self.words.insert(word.into(), id);
         id
     }
 
     fn child(&mut self, parent: usize, segment: &str) -> usize {
-        if let Some(child) = self.nodes[parent].children.get(segment) {
-            return *child;
+        match self.nodes[parent].child_position(segment) {
+            Ok(index) => self.nodes[parent].children[index].1 as usize,
+            Err(index) => {
+                let child = self.nodes.len();
+                self.nodes.push(WordNode::default());
+                self.nodes[parent]
+                    .children
+                    .insert(index, (segment.into(), child as u32));
+                child
+            },
         }
-        let child = self.nodes.len();
-        self.nodes.push(WordNode::default());
-        self.nodes[parent].children.insert(segment.to_string(), child);
-        child
+    }
+
+    /// Drop the spare capacity growth left, which is most of a one-entry node.
+    fn shrink(&mut self) {
+        self.nodes.shrink_to_fit();
+        self.words.shrink_to_fit();
+        for node in &mut self.nodes {
+            node.children.shrink_to_fit();
+            node.counts.shrink_to_fit();
+        }
     }
 
     /// Scan characters once to find Unicode whitespace words and ASCII-space
@@ -490,7 +519,7 @@ impl NextWords {
             self.nodes.push(WordNode::default());
         }
         if let Some(&(_, id)) = words.first() {
-            *self.nodes[0].counts.entry(id).or_default() += 1;
+            self.nodes[0].count(id);
         }
         let mut node = 0;
         let mut segment_start = 0;
@@ -503,7 +532,7 @@ impl NextWords {
                 word += 1;
             }
             if let Some(&(_, id)) = words.get(word) {
-                *self.nodes[node].counts.entry(id).or_default() += 1;
+                self.nodes[node].count(id);
             }
         }
         Ok(())
@@ -512,13 +541,13 @@ impl NextWords {
     fn diagnostics(&self) -> (usize, usize, usize) {
         let mut entries = 0;
         let mut bytes = self.nodes.capacity() * std::mem::size_of::<WordNode>()
-            + self.words.capacity() * std::mem::size_of::<(String, usize)>()
-            + self.words.keys().map(String::capacity).sum::<usize>();
+            + self.words.capacity() * std::mem::size_of::<(Box<str>, u32)>()
+            + self.words.keys().map(|word| word.len()).sum::<usize>();
         for node in &self.nodes {
             entries += node.counts.len();
-            bytes += node.children.capacity() * std::mem::size_of::<(String, usize)>()
-                + node.counts.capacity() * std::mem::size_of::<(usize, usize)>();
-            bytes += node.children.keys().map(String::capacity).sum::<usize>();
+            bytes += node.children.capacity() * std::mem::size_of::<(Box<str>, u32)>()
+                + node.counts.capacity() * std::mem::size_of::<(u32, u32)>();
+            bytes += node.children.iter().map(|(edge, _)| edge.len()).sum::<usize>();
         }
         (self.nodes.len(), entries, bytes)
     }
@@ -805,7 +834,6 @@ fn acceptance_name_bytes(name: &str) -> usize {
 fn first_word_count(counts: NextWordCounts<'_>, value: &str) -> usize {
     counts
         .get(value.split_whitespace().next().unwrap_or_default())
-        .copied()
         .unwrap_or_default()
 }
 
@@ -1055,6 +1083,9 @@ pub fn merge_history_with_prefix(
     let static_names: HashSet<&str> = result.suggestions.iter().flat_map(suggestion_name_spellings).collect();
     let fresh: Vec<Suggestion> = history
         .into_iter()
+        // A past command that is exactly what is typed has nothing to insert,
+        // yet as an exact match it would lead the list.
+        .filter(|item| item.name != query && item.name != result.search_term)
         .filter(|item| !static_names.contains(item.name.as_str()))
         .collect();
     result.suggestions.extend(fresh);
@@ -1931,6 +1962,30 @@ mod tests {
     }
 
     #[test]
+    fn history_does_not_offer_what_is_already_typed() {
+        let frecency = Frecency::from_commands([
+            ("git ch".to_string(), 1),
+            ("git checkout dev".to_string(), 2),
+            ("ls".to_string(), 3),
+            ("ls -la".to_string(), 4),
+        ]);
+        let merged = |tokens: &[&str], term: &str| {
+            let mut result = CompleteResult {
+                search_term: term.into(),
+                match_term: term.into(),
+                ..CompleteResult::default()
+            };
+            let tokens: Vec<String> = tokens.iter().map(ToString::to_string).collect();
+            merge_history(&mut result, &tokens, &frecency, false);
+            result.suggestions.into_iter().map(|row| row.name).collect::<Vec<_>>()
+        };
+        assert_eq!(merged(&["git", "ch"], "ch"), ["checkout dev"]);
+        assert_eq!(merged(&["ls"], "ls"), ["ls -la"]);
+        // Another case still has something to insert.
+        assert!(merged(&["git", "CH"], "CH").iter().any(|name| name == "ch"));
+    }
+
+    #[test]
     fn history_uses_recent_source_order_and_last_duplicate_wins() {
         // History rows arrive oldest-first (including custom-command output),
         // so the old generator walks them backwards before deduplicating.
@@ -2247,8 +2302,8 @@ mod tests {
         frecency.append_commands(["git commit".to_string(), "  ".to_string()]);
         assert_eq!(before.len(), 1);
         assert_eq!(frecency.command_lines().len(), 2);
-        assert_eq!(frecency.next_word_counts("git").get("commit"), Some(&1));
-        assert_eq!(frecency.next_word_counts("git").get("status"), Some(&1));
+        assert_eq!(frecency.next_word_counts("git").get("commit"), Some(1));
+        assert_eq!(frecency.next_word_counts("git").get("status"), Some(1));
     }
 
     #[test]
@@ -2354,7 +2409,7 @@ mod tests {
                 let frecency = Frecency::from_commands([(command.clone(), 0), (command.clone(), 1)]);
                 let trimmed = command.trim();
                 let prefix = trimmed.rsplit_once(' ').unwrap().0;
-                assert_eq!(frecency.next_word_counts(prefix).get("x"), Some(&2));
+                assert_eq!(frecency.next_word_counts(prefix).get("x"), Some(2));
                 let (nodes, _, bytes) = frecency.next_words_diagnostics();
                 assert!(nodes <= 10_003);
                 assert!(
@@ -2375,7 +2430,7 @@ mod tests {
         let word = "x".repeat(32 * 1024);
         let command = format!("echo {}{word}", " ".repeat(4096));
         let frecency = Frecency::from_commands([(command.clone(), 0)]);
-        assert_eq!(frecency.next_word_counts("echo").get(&word), Some(&1));
+        assert_eq!(frecency.next_word_counts("echo").get(&word), Some(1));
         assert_eq!(
             frecency
                 .next_word_counts(&format!("echo {}", " ".repeat(4095)))
