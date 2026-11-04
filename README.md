@@ -67,7 +67,7 @@ a named Rust adapter at build time too.
 
 Native builds are the Apple Silicon DMGs from this repository:
 
-[Download latest DMG](https://github.com/codeime/easy-complete/releases/download/v0.0.23/Fastab-arm64.dmg) ·
+[Download latest DMG](https://github.com/codeime/easy-complete/releases/download/v0.0.24/Fastab-arm64.dmg) ·
 [All releases](https://github.com/codeime/easy-complete/releases)
 
 Then:

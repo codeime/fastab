@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.24
+
+- change: the desktop app and each terminal tab should use much less memory. Both now start with macOS's space-efficient malloc setting, because by default freed memory stayed with the process. Started this way, v0.0.23 idled at 15 to 20 MB on the machine we tested, against 39 to 50 MB in earlier runs that also opened Settings and handled more completions. Each tab uses about 0.4 MB less. Completion times on CI did not change.
+- change: each keystroke now builds at most 200 history rows, the newest matches. With a large shell history, `git ` matched more than 5,000 rows on every keystroke for a list that shows six. Older commands beyond those 200 appear once you type more of them.
+
 ## v0.0.23
 
 - fix: a past command identical to what you typed no longer leads the list. With `git ch` in your shell history, typing `git ch` showed a `ch` row first, and accepting it inserted nothing.
