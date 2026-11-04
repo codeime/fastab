@@ -1,5 +1,9 @@
 # Changelog
 
+## v0.0.25
+
+- fix: the menu bar icon is back. v0.0.24 lost it on macOS 27, because the app restarted itself at launch to apply its memory setting. The app now gets that setting from its Info.plist. If you launch the binary directly instead of through the Dock, Finder or `open`, it runs with the default memory behavior.
+
 ## v0.0.24
 
 - change: the desktop app and each terminal tab should use much less memory. Both now start with macOS's space-efficient malloc setting, because by default freed memory stayed with the process. Started this way, v0.0.23 idled at 15 to 20 MB on the machine we tested, against 39 to 50 MB in earlier runs that also opened Settings and handled more completions. Each tab uses about 0.4 MB less. Completion times on CI did not change.
