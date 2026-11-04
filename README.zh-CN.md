@@ -64,7 +64,7 @@ spec hook（`postProcess`、`script`、`custom`、`generateSpec`）同样在构�
 
 Native 构建是本仓库的 Apple Silicon DMG：
 
-[下载最新版 DMG](https://github.com/codeime/easy-complete/releases/download/v0.0.21/Fastab-arm64.dmg) ·
+[下载最新版 DMG](https://github.com/codeime/easy-complete/releases/download/v0.0.22/Fastab-arm64.dmg) ·
 [所有 Releases](https://github.com/codeime/easy-complete/releases)
 
 然后：

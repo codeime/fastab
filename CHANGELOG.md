@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.0.22
+
+- change: slow suggestions no longer hold up the list. A generator that took 80 ms or more last time now loads after the options and subcommands are shown.
+- change: completions are faster after a pause. On CI, the first `git che` after one went from about 75 ms to about 25 ms and `cargo b` from about 128 ms to about 14 ms. While you keep typing in a token, `git che` went from about 19 ms to about 1 ms, because commands such as `git help -a` run once per command prefix instead of once per keystroke. Their results are reused for up to five minutes, so a new git alias or package.json script can take that long to appear.
+- change: history suggestions for zsh and bash now come from your shell's history file, and fish reads its own file directly. Earlier versions tried to list zsh and bash history through a login shell, got nothing, and were left with only the commands Fastab had recorded. If you set `HISTFILE` in `.zshrc` without exporting it, Fastab reads the default path instead.
+- change: history stays current while the app runs. Commands you finish in a Fastab terminal reach history suggestions and ranking within seconds, instead of at the next launch.
+- change: opening a terminal starts `ftab` once per rc file instead of twice, and a prompt starts it only when your exports or aliases changed. On CI the integration added about 25 to 33 ms to a zsh start, down from about 38 ms, and about 14 ms with the app closed, down from about 29 ms.
+
 ## v0.0.21
 
 - change: each terminal tab uses about a third less memory, roughly 1.2 MB less per tab. The terminal process now uses the system memory allocator instead of mimalloc, which held about 2 MB for a tab that needs well under 1 MB.
