@@ -1836,7 +1836,7 @@
     {
       "diagnostic": "Success",
       "dimension": "shell",
-      "expectCalls": 1,
+      "expectCalls": 0,
       "name": "shell-env-home-zsh",
       "request": {
         "buffer": "env ",
@@ -1879,7 +1879,7 @@
     {
       "diagnostic": "Success",
       "dimension": "shell",
-      "expectCalls": 1,
+      "expectCalls": 0,
       "name": "shell-env-home-bash",
       "request": {
         "buffer": "env ",
@@ -1922,7 +1922,7 @@
     {
       "diagnostic": "Success",
       "dimension": "shell",
-      "expectCalls": 1,
+      "expectCalls": 0,
       "name": "shell-kubectl-kubeconfig",
       "request": {
         "buffer": "kubectl config use-context ",
