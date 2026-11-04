@@ -7,8 +7,8 @@
 //! This replays that with a short grace and prints medians in ms, then splits
 //! a cold spec load and a cold catalog load into their steps. Generator rows
 //! run real commands in the current directory. Requests come from zsh with
-//! HOME on a scratch directory holding a 10,000-command `.zsh_history`, so
-//! the first one also loads shell history the way the desktop does.
+//! HOME on a scratch directory, and the rounds run on an engine that loaded a
+//! 10,000-command `.zsh_history` the way the desktop does.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -28,44 +28,74 @@ const SPECS: &[&str] = &["git", "docker", "npm", "kubectl", "cargo"];
 const SESSION: SessionId = SessionId::new(1);
 const HISTORY_COMMANDS: usize = 10_000;
 
+struct Probe {
+    client: EngineClient,
+    cwd: String,
+    environment: Arc<Vec<(String, String)>>,
+}
+
+impl Probe {
+    fn complete(&self, buffer: &str) -> anyhow::Result<Duration> {
+        let request = CompleteRequest {
+            buffer: buffer.into(),
+            cwd: self.cwd.clone(),
+            include_history: false,
+            current_shell: Some("/bin/zsh".into()),
+            environment_variables: Arc::clone(&self.environment),
+            ..CompleteRequest::default()
+        };
+        let started = Instant::now();
+        futures::executor::block_on(self.client.complete_for_session(SESSION, request))
+            .with_context(|| format!("complete {buffer:?}"))?;
+        Ok(started.elapsed())
+    }
+}
+
+/// A new engine's first request; an unknown command loads no spec and runs
+/// no hook, so it times the build and the history load alone.
+fn first_request(specs: &Path, cwd: &str, home: &Path, label: &str) -> anyhow::Result<Probe> {
+    let started = Instant::now();
+    let client = EngineClient::spawn_with_options(specs.to_path_buf(), EngineClientOptions { spec_idle_grace: GRACE })?;
+    let spawned = started.elapsed();
+    let probe = Probe {
+        client,
+        cwd: cwd.to_string(),
+        environment: Arc::new(vec![("HOME".to_string(), home.display().to_string())]),
+    };
+    let engine = probe.complete("fastab-cold-load-unknown ")?;
+    let git = probe.complete("git ")?;
+    println!(
+        "first request, {label}: {:.1} = client spawn {:.1}, engine build {:.1}, then `git ` {:.1}",
+        ms(started.elapsed()),
+        ms(spawned),
+        ms(engine),
+        ms(git)
+    );
+    Ok(probe)
+}
+
 fn main() -> anyhow::Result<()> {
     let specs = std::env::args()
         .nth(1)
         .map_or_else(|| PathBuf::from("bundle/specs-ir"), PathBuf::from);
     ensure!(specs.join("index.json").is_file(), "no spec IR at {}", specs.display());
     let cwd = std::env::current_dir()?.display().to_string();
+    let empty_home = tempfile::tempdir()?;
     let home = tempfile::tempdir()?;
     let history_bytes = write_zsh_history(home.path())?;
-    let environment = Arc::new(vec![("HOME".to_string(), home.path().display().to_string())]);
-    let started = Instant::now();
-    let client = EngineClient::spawn_with_options(specs.clone(), EngineClientOptions { spec_idle_grace: GRACE })?;
-    let complete = |buffer: &str| -> anyhow::Result<Duration> {
-        let request = CompleteRequest {
-            buffer: buffer.into(),
-            cwd: cwd.clone(),
-            include_history: false,
-            current_shell: Some("/bin/zsh".into()),
-            environment_variables: Arc::clone(&environment),
-            ..CompleteRequest::default()
-        };
-        let started = Instant::now();
-        futures::executor::block_on(client.complete_for_session(SESSION, request))
-            .with_context(|| format!("complete {buffer:?}"))?;
-        Ok(started.elapsed())
-    };
-    let spawned = started.elapsed();
-    // The first request builds the engine and loads history; an unknown
-    // command loads no spec and runs no hook, so it times those alone.
-    let engine = complete("fastab-cold-load-unknown ")?;
-    let git = complete("git ")?;
-    println!(
-        "first request {:.1}: client spawn {:.1}, engine build + zsh history ({HISTORY_COMMANDS} commands, {} KB) {:.1}, then `git ` {:.1}",
-        ms(started.elapsed()),
-        ms(spawned),
-        history_bytes / 1024,
-        ms(engine),
-        ms(git)
-    );
+    // The first engine pays for cold files, the second is the same build warm,
+    // and the third differs from it only by the history it loads.
+    first_request(&specs, &cwd, empty_home.path(), "cold, no history")?;
+    first_request(&specs, &cwd, empty_home.path(), "warm, no history")?;
+    let probe = first_request(
+        &specs,
+        &cwd,
+        home.path(),
+        &format!(
+            "warm, {HISTORY_COMMANDS}-command zsh history ({} KB)",
+            history_bytes / 1024
+        ),
+    )?;
     // What the first request used to spend on history: a login zsh, which
     // sources the profile but not /etc/zshrc, so it has no HISTFILE.
     let started = Instant::now();
@@ -94,12 +124,12 @@ fn main() -> anyhow::Result<()> {
         let mut warm = Vec::with_capacity(ROUNDS);
         let mut typing = Vec::with_capacity(ROUNDS);
         for _ in 0..ROUNDS {
-            client.end_input(SESSION)?;
+            probe.client.end_input(SESSION)?;
             std::thread::sleep(GRACE * 4);
-            idle.push(complete(buffer)?);
-            warm.push(complete(buffer)?);
+            idle.push(probe.complete(buffer)?);
+            warm.push(probe.complete(buffer)?);
             // The next keystroke in the same token, as typing produces it.
-            typing.push(complete(&format!("{buffer}x"))?);
+            typing.push(probe.complete(&format!("{buffer}x"))?);
         }
         println!(
             "{buffer:?}: after idle {:.1}, warm {:.1}, next key {:.1}",
@@ -109,9 +139,9 @@ fn main() -> anyhow::Result<()> {
         );
     }
     // What "after idle" rebuilt: nothing may stay cached past the grace.
-    client.end_input(SESSION)?;
+    probe.client.end_input(SESSION)?;
     std::thread::sleep(GRACE * 4);
-    let engine = futures::executor::block_on(client.diagnostics())?
+    let engine = futures::executor::block_on(probe.client.diagnostics())?
         .engine
         .context("no engine")?;
     println!(
