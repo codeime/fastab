@@ -3953,6 +3953,7 @@ mod tests {
             specs.path().to_path_buf(),
             fastab_engine::EngineClientOptions {
                 spec_idle_grace: Duration::from_millis(50),
+                ..fastab_engine::EngineClientOptions::default()
             },
         )
         .expect("engine");

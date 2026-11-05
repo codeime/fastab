@@ -55,7 +55,13 @@ impl Probe {
 /// no hook, so it times the build and the history load alone.
 fn first_request(specs: &Path, cwd: &str, home: &Path, label: &str) -> anyhow::Result<Probe> {
     let started = Instant::now();
-    let client = EngineClient::spawn_with_options(specs.to_path_buf(), EngineClientOptions { spec_idle_grace: GRACE })?;
+    let client = EngineClient::spawn_with_options(
+        specs.to_path_buf(),
+        EngineClientOptions {
+            spec_idle_grace: GRACE,
+            ..EngineClientOptions::default()
+        },
+    )?;
     let spawned = started.elapsed();
     let probe = Probe {
         client,

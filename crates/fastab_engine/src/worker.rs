@@ -50,12 +50,15 @@ pub struct EngineClientOptions {
     /// Idle grace for specs and hook results in controlled resource replay.
     /// Normal clients use the default.
     pub spec_idle_grace: Duration,
+    /// How long after its last use loaded history stays resident.
+    pub history_idle_grace: Duration,
 }
 
 impl Default for EngineClientOptions {
     fn default() -> Self {
         Self {
             spec_idle_grace: crate::ir::SPEC_IDLE_GRACE,
+            history_idle_grace: crate::runtime::HISTORY_IDLE_GRACE,
         }
     }
 }
@@ -505,12 +508,12 @@ impl EngineClient {
     }
 
     pub fn spawn_with_options(specs_dir: PathBuf, options: EngineClientOptions) -> anyhow::Result<Self> {
-        Self::spawn_supervised(specs_dir, None, options.spec_idle_grace)
+        Self::spawn_supervised(specs_dir, None, options)
     }
 
     #[cfg(test)]
     fn spawn_with_timeout(specs_dir: PathBuf, attempt_timeout: Duration) -> anyhow::Result<Self> {
-        Self::spawn_supervised(specs_dir, Some(attempt_timeout), crate::ir::SPEC_IDLE_GRACE)
+        Self::spawn_supervised(specs_dir, Some(attempt_timeout), EngineClientOptions::default())
     }
 
     #[cfg(test)]
@@ -519,14 +522,25 @@ impl EngineClient {
         attempt_timeout: Duration,
         idle_grace: Duration,
     ) -> anyhow::Result<Self> {
-        Self::spawn_supervised(specs_dir, Some(attempt_timeout), idle_grace)
+        Self::spawn_supervised(
+            specs_dir,
+            Some(attempt_timeout),
+            EngineClientOptions {
+                spec_idle_grace: idle_grace,
+                ..EngineClientOptions::default()
+            },
+        )
     }
 
     fn spawn_supervised(
         specs_dir: PathBuf,
         fixed_attempt_timeout: Option<Duration>,
-        idle_grace: Duration,
+        options: EngineClientOptions,
     ) -> anyhow::Result<Self> {
+        let EngineClientOptions {
+            spec_idle_grace: idle_grace,
+            history_idle_grace,
+        } = options;
         let (tx, rx) = job_channel();
         let supervisor_specs_dir = specs_dir.clone();
         let acceptance = Arc::new(Mutex::new(AcceptanceIndex::load()));
@@ -554,13 +568,15 @@ impl EngineClient {
                 let mut jobs_without_attempt = 0;
                 loop {
                     rx.set_resource_session(active_session);
-                    let first = match wait_for_engine_job(&rx, engine.as_ref(), idle_grace) {
+                    let first = match wait_for_engine_job(&rx, engine.as_ref(), idle_grace, history_idle_grace) {
                         Ok(job) => job,
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             // No queued completion. The attempt thread is not
                             // holding this engine, so the deadline may release.
                             if let Some(engine) = engine.as_mut() {
-                                engine.release_idle_specs(Instant::now(), idle_grace);
+                                let now = Instant::now();
+                                engine.release_idle_specs(now, idle_grace);
+                                engine.release_idle_history(now, history_idle_grace);
                             }
                             jobs_without_attempt = 0;
                             continue;
@@ -1212,8 +1228,16 @@ fn wait_for_engine_job(
     rx: &JobReceiver,
     engine: Option<&Engine>,
     grace: Duration,
+    history_grace: Duration,
 ) -> Result<Job, mpsc::RecvTimeoutError> {
-    let Some(deadline) = engine.and_then(|engine| engine.next_idle_deadline(grace)) else {
+    let deadline = engine.and_then(|engine| {
+        engine
+            .next_idle_deadline(grace)
+            .into_iter()
+            .chain(engine.next_history_deadline(history_grace))
+            .min()
+    });
+    let Some(deadline) = deadline else {
         return rx.recv().map_err(|_disconnected| mpsc::RecvTimeoutError::Disconnected);
     };
     let timeout = deadline.saturating_duration_since(Instant::now());
@@ -2149,6 +2173,7 @@ mod tests {
             dir.path().to_path_buf(),
             EngineClientOptions {
                 spec_idle_grace: Duration::from_millis(40),
+                ..EngineClientOptions::default()
             },
         )
         .unwrap();
@@ -2756,6 +2781,55 @@ mod tests {
     }
 
     #[test]
+    fn supervisor_releases_idle_history_without_another_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        write_idle_specs(dir.path());
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(home.path().join(".zsh_history"), ": 1:0;git status\n: 2:0;git add\n").unwrap();
+        let client = EngineClient::spawn_with_options(
+            dir.path().to_path_buf(),
+            EngineClientOptions {
+                history_idle_grace: Duration::from_millis(300),
+                ..EngineClientOptions::default()
+            },
+        )
+        .expect("spawn");
+        let complete = || {
+            let request = CompleteRequest {
+                buffer: "git status".into(),
+                cwd: "/".into(),
+                current_shell: Some("/bin/zsh".into()),
+                environment_variables: Arc::new(vec![("HOME".to_string(), home.path().display().to_string())]),
+                ..CompleteRequest::default()
+            };
+            futures::executor::block_on(client.complete(request)).expect("complete");
+        };
+        let lines = || {
+            futures::executor::block_on(client.diagnostics())
+                .expect("diagnostics")
+                .engine
+                .expect("engine")
+                .history
+                .line_count
+        };
+        complete();
+        assert_eq!(lines(), 2);
+        // The deadline is absolute, so these diagnostics jobs do not push it back.
+        let started = Instant::now();
+        while lines() != 0 {
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "supervisor did not release idle history"
+            );
+            thread::sleep(Duration::from_millis(30));
+        }
+        // The engine and its index stay, and the next request reads history again.
+        complete();
+        assert_eq!(lines(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn supervisor_releases_an_idle_file_without_another_completion() {
         let dir = tempfile::tempdir().unwrap();
         write_idle_specs(dir.path());
@@ -2823,7 +2897,7 @@ mod tests {
         let (tx, rx) = job_channel();
         let (done, received) = mpsc::channel();
         let waiter = thread::spawn(move || {
-            let result = wait_for_engine_job(&rx, Some(&engine), grace);
+            let result = wait_for_engine_job(&rx, Some(&engine), grace, crate::runtime::HISTORY_IDLE_GRACE);
             let _ = done.send((result, engine));
         });
         let observed = received.recv_timeout(Duration::from_secs(2));
@@ -2871,7 +2945,7 @@ mod tests {
         let (tx, rx) = job_channel();
         let (done, received) = mpsc::channel();
         let waiter = thread::spawn(move || {
-            let result = wait_for_engine_job(&rx, Some(&engine), grace);
+            let result = wait_for_engine_job(&rx, Some(&engine), grace, crate::runtime::HISTORY_IDLE_GRACE);
             let _ = done.send((result, engine));
         });
         let observed = received.recv_timeout(Duration::from_secs(2));

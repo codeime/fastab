@@ -102,7 +102,13 @@ fn main() -> anyhow::Result<()> {
     }
     let environment = Arc::new(vec![("HOME".to_string(), home.path().display().to_string())]);
     sample("start");
-    let client = EngineClient::spawn_with_options(specs, EngineClientOptions { spec_idle_grace: GRACE })?;
+    let client = EngineClient::spawn_with_options(
+        specs,
+        EngineClientOptions {
+            spec_idle_grace: GRACE,
+            ..EngineClientOptions::default()
+        },
+    )?;
     let complete = |buffer: &str| -> anyhow::Result<()> {
         let request = CompleteRequest {
             buffer: buffer.into(),

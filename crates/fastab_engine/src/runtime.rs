@@ -31,6 +31,11 @@ fn should_merge_history(include_history: bool, disabled: bool) -> bool {
     include_history && history_loading_enabled(disabled)
 }
 
+/// How long after its last use loaded history stays resident. It is the largest
+/// thing an idle engine holds, about 2 MB for 10,000 commands, and reading it
+/// back costs the next request about 10 ms and picks up what other terminals wrote.
+pub(crate) const HISTORY_IDLE_GRACE: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 /// How often a stream of requests looks for commands that finished since.
 const HISTORY_CHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
@@ -374,6 +379,9 @@ pub struct Engine {
     /// The database row new commands are read after; `None` follows nothing.
     history_database_row: Option<i64>,
     history_checked_at: std::time::Instant,
+    /// Last use of history this engine loaded itself. Stays `None` for history a
+    /// caller supplied, which has no source to read back from.
+    history_used_at: Option<std::time::Instant>,
     /// Spec-aware `template: "history"` index over the frecency lines. Rebuilt
     /// only when the loaded history changes; requests share it by `Arc`.
     history: Arc<crate::history::HistoryStore>,
@@ -442,6 +450,7 @@ impl Engine {
             history_source: None,
             history_database_row: None,
             history_checked_at: std::time::Instant::now(),
+            history_used_at: None,
             history: Arc::default(),
             generator_session: crate::generate::GeneratorSession::default(),
             hook_cache_active: false,
@@ -573,6 +582,27 @@ impl Engine {
         {
             self.native = None;
             self.native_idle_since = None;
+        }
+    }
+
+    /// When loaded history goes unused for `grace`. One wake-up per quiet
+    /// period: releasing it clears the deadline until a request loads it again.
+    pub(crate) fn next_history_deadline(&self, grace: std::time::Duration) -> Option<std::time::Instant> {
+        self.history_used_at?.checked_add(grace)
+    }
+
+    pub(crate) fn release_idle_history(&mut self, now: std::time::Instant, grace: std::time::Duration) {
+        if self
+            .next_history_deadline(grace)
+            .is_some_and(|deadline| now >= deadline)
+        {
+            self.frecency = Frecency::default();
+            self.history = Arc::default();
+            self.frecency_loaded = false;
+            self.history_source = None;
+            self.history_database_row = None;
+            self.history_index_idle_since = None;
+            self.history_used_at = None;
         }
     }
 
@@ -742,6 +772,9 @@ impl Engine {
         );
         if self.frecency_loaded && self.history_source.as_ref() == Some(&source) {
             self.append_new_history(&source);
+            if self.history_used_at.is_some() {
+                self.history_used_at = Some(std::time::Instant::now());
+            }
             return;
         }
         // Read before the load: a command that finishes during it may count
@@ -760,6 +793,7 @@ impl Engine {
             self.history_source = Some(source);
             self.history_database_row = database_row;
             self.history_checked_at = std::time::Instant::now();
+            self.history_used_at = Some(self.history_checked_at);
         });
     }
 
@@ -2819,6 +2853,64 @@ mod tests {
         assert_eq!(git.insert_value.as_deref(), Some("git"));
         assert!(!git.should_add_space);
         assert_eq!(result.search_term, "git");
+    }
+
+    #[test]
+    fn idle_history_is_released_and_the_next_request_reads_it_again() {
+        let _lock = engine_lock();
+        let specs = tempfile::tempdir().unwrap();
+        write_spec(specs.path(), "git", r#"{"names":["git"]}"#);
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join(".zsh_history");
+        fs::write(&file, ": 1:0;git status\n: 2:0;git add\n").unwrap();
+        let request = || CompleteRequest {
+            buffer: "git ".into(),
+            cwd: "/".into(),
+            current_shell: Some("/bin/zsh".into()),
+            environment_variables: Arc::new(vec![("HOME".to_string(), home.path().display().to_string())]),
+            ..CompleteRequest::default()
+        };
+        let grace = Duration::from_secs(60);
+        let mut engine = Engine::new(specs.path().to_path_buf()).expect("engine");
+        assert!(engine.next_history_deadline(grace).is_none(), "nothing loaded yet");
+        engine.complete(request()).expect("complete");
+        assert_eq!(engine.diagnostics().history.line_count, 2);
+
+        let deadline = engine
+            .next_history_deadline(grace)
+            .expect("loaded history has a deadline");
+        engine.release_idle_history(deadline - Duration::from_millis(1), grace);
+        assert_eq!(engine.diagnostics().history.line_count, 2);
+        engine.release_idle_history(deadline, grace);
+        assert_eq!(engine.diagnostics().history.line_count, 0);
+        assert!(
+            engine.next_history_deadline(grace).is_none(),
+            "a quiet engine is not woken again"
+        );
+
+        fs::write(&file, ": 1:0;git status\n: 2:0;git add\n: 3:0;git log\n").unwrap();
+        engine.complete(request()).expect("complete");
+        assert_eq!(engine.diagnostics().history.line_count, 3);
+        assert!(engine.next_history_deadline(grace).is_some());
+    }
+
+    #[test]
+    fn history_a_caller_supplied_is_never_released() {
+        let _lock = engine_lock();
+        let specs = tempfile::tempdir().unwrap();
+        write_spec(specs.path(), "git", r#"{"names":["git"]}"#);
+        let frecency = Frecency::from_commands([("git status".into(), 1)]);
+        let mut engine = Engine::new_with_frecency(specs.path().to_path_buf(), frecency).expect("engine");
+        engine
+            .complete(CompleteRequest {
+                buffer: "git ".into(),
+                cwd: "/".into(),
+                ..CompleteRequest::default()
+            })
+            .expect("complete");
+        assert!(engine.next_history_deadline(Duration::ZERO).is_none());
+        engine.release_idle_history(std::time::Instant::now(), Duration::ZERO);
+        assert_eq!(engine.diagnostics().history.line_count, 1);
     }
 
     #[test]
