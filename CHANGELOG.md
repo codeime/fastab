@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.26
+
+- perf: closing Settings now gives its memory back. Settings runs in its own process, which exits when the window closes, so FasTab's main process no longer stays about 12 MB larger after you open it. While the window is open, Activity Monitor shows a second FasTab with about 50 MB. On the machine we tested, opening the window took about 0.3 s, or about 0.75 s when nothing was cached. The first time you open the menu bar menu still adds about 6 MB to the main process, once.
+- perf: command history loaded for completions is released after ten idle minutes and read back when you next type.
+
 ## v0.0.25
 
 - fix: the menu bar icon is back. v0.0.24 lost it on macOS 27, because the app restarted itself at launch to apply its memory setting. The app now gets that setting from its Info.plist. If you launch the binary directly instead of through the Dock, Finder or `open`, it runs with the default memory behavior.
