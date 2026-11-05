@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.0.26-beta.1
+
+- Test build, not offered as an update. Settings now runs in its own process, which exits when the window closes, so closing it returns all the memory it used. The window can behave differently when opening or coming to the front, so that is what this build is for checking.
+- perf: command history loaded for completions is released after ten idle minutes.
+
 ## v0.0.25
 
 - fix: the menu bar icon is back. v0.0.24 lost it on macOS 27, because the app restarted itself at launch to apply its memory setting. The app now gets that setting from its Info.plist. If you launch the binary directly instead of through the Dock, Finder or `open`, it runs with the default memory behavior.

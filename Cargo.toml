@@ -18,7 +18,7 @@ authors = ["Fastab Contributors"]
 edition = "2024"
 homepage = "https://fastab.app/"
 publish = false
-version = "0.0.25"
+version = "0.0.26-beta.1"
 license = "MIT"
 
 [workspace.dependencies]
