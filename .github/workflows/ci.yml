@@ -5,7 +5,7 @@ on:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [main]
+    branches: [main, settings-process]
 
 permissions:
   contents: read
@@ -299,7 +299,7 @@ jobs:
       # tag pipeline in release.yml. Keep the smoke on main so profile-specific
       # breakage (panic = "abort", LTO, strip) still lands before a tag.
       - name: Build release binaries (dist profile)
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/settings-process'
         run: cargo build --locked --profile dist -p fastab_desktop -p fastab_term -p fastab_cli -p fastab_input_method
 
       # This is the shipped configuration (strip = "symbols", all four packages
@@ -309,7 +309,7 @@ jobs:
       # script sees DEBUG=false, which cc also reads to decide on `-g`, so debug
       # sections in libmimalloc.a mean the dist profile's line tables reached it.
       - name: Check dSYMs and the mimalloc release build
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/settings-process'
         run: |
           set -euo pipefail
           ./scripts/collect-dsyms.sh target/dist-dSYMs \
@@ -329,7 +329,7 @@ jobs:
       # libSystem; a framework link that comes back costs every tab its
       # initializers and data pages (crates/fastab_term/build.rs).
       - name: Verify fterm links only libSystem
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/settings-process'
         run: |
           links="$(otool -L target/dist/fterm | tail -n +2 | awk '{print $1}')"
           echo "$links"
@@ -340,7 +340,7 @@ jobs:
       # readable from the public API (escaping as in scripts/binary-size-report.sh).
       # A measurement, not a gate: a runner without `footprint` must not fail main.
       - name: Measure fterm footprint
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/settings-process'
         continue-on-error: true
         run: |
           for size in 40x120 60x240; do
@@ -353,7 +353,7 @@ jobs:
       # adds to every shell start, and the first completion after the engine
       # retired its caches (10 s after input ends) against a warm one.
       - name: Measure shell startup and cold completion
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/settings-process'
         continue-on-error: true
         run: |
           python3 scripts/shell-startup-cost.py target/dist/ftab | tee target/shell-startup.txt
@@ -366,7 +366,7 @@ jobs:
       # A hosted runner may have no Metal device, so this reports and does not
       # gate. The notice carries the window's footprint and how long each exit took.
       - name: Exercise the Settings process
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/settings-process'
         continue-on-error: true
         run: |
           python3 scripts/settings-process-smoke.py target/dist/fastab 2>&1 | tee target/settings-process.txt
@@ -377,7 +377,7 @@ jobs:
       # What the engine leaves in the heap, with the allocator setting the desktop
       # and fterm start with and without it. Engine only, so no frameworks.
       - name: Measure engine memory
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        if: github.event_name == 'push' && github.ref == 'refs/heads/settings-process'
         continue-on-error: true
         run: |
           set -o pipefail
