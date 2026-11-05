@@ -14,6 +14,7 @@ The messages are pinned in `settings_process.rs`. Exits non-zero on any failure.
 
 import json
 import os
+import re
 import select
 import socket
 import subprocess
@@ -26,12 +27,9 @@ EXIT_TIMEOUT = 8  # The process's own forced exit is 2 s after EOF.
 
 
 def footprint_kib(pid):
-    out = subprocess.run(["footprint", str(pid)], capture_output=True, text=True).stdout
-    for line in out.splitlines():
-        if line.strip().startswith("Footprint:"):
-            value, unit = line.split()[1:3]
-            return float(value) * {"KB": 1, "MB": 1024, "GB": 1024 * 1024}.get(unit, 1)
-    return None
+    out = subprocess.run(["footprint", "-f", "bytes", str(pid)], capture_output=True, text=True).stdout
+    match = re.search(r"Footprint: (\d+) B", out)
+    return int(match.group(1)) // 1024 if match else None
 
 
 class Helper:
@@ -106,7 +104,7 @@ def main():
         time.sleep(3)
         kib = footprint_kib(helper.process.pid)
         if kib is not None:
-            print(f"footprint with the window {kib:7.0f} KiB")
+            print(f"footprint with the window {kib:7d} KiB")
         helper.send({"Show": {"path": None}})
         helper.wait_for("Shown")
         helper.send("RefreshPermissions")
