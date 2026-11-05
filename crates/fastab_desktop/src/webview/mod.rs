@@ -18,7 +18,7 @@ use crate::platform::{PlatformBoundEvent, PlatformState};
 use crate::remote_ipc::RemoteHook;
 use crate::tray::build_tray;
 pub use crate::webview::window_id::{AUTOCOMPLETE_ID, DASHBOARD_ID, WindowId};
-use crate::{EventLoopProxy, EventLoopWindowTarget, file_watcher, local_ipc};
+use crate::{EventLoopProxy, file_watcher, local_ipc};
 
 pub const DASHBOARD_SIZE: LogicalSize<f64> = LogicalSize::new(820.0, 640.0);
 
@@ -51,17 +51,7 @@ pub static GLOBAL_PROXY: OnceLock<EventLoopProxy> = OnceLock::new();
 impl WebviewManager {
     #[allow(unused_variables)]
     #[allow(unused_mut)]
-    pub fn new(context: Arc<Context>, visible: bool, show_dashboard_after_normal_launch: bool) -> Self {
-        #[cfg(target_os = "macos")]
-        if !visible {
-            use tao::platform::macos::ActivationPolicy;
-
-            use crate::platform::ACTIVATION_POLICY;
-
-            *ACTIVATION_POLICY.lock().unwrap() = ActivationPolicy::Accessory;
-            crate::platform::set_activation_policy(ActivationPolicy::Accessory);
-        }
-
+    pub fn new(context: Arc<Context>, show_dashboard_after_normal_launch: bool) -> Self {
         let (proxy, event_rx) = crate::event_loop::channel();
         GLOBAL_PROXY.set(proxy.clone()).unwrap();
 
@@ -84,9 +74,8 @@ impl WebviewManager {
     /// runs inside `block_on`, and the UI loop must not (see `main.rs`).
     #[allow(unused_mut)]
     pub async fn prepare(mut self) -> anyhow::Result<crate::gpui_host::Setup> {
-        let window_target = EventLoopWindowTarget;
         self.platform_state
-            .handle(PlatformBoundEvent::Initialize, &window_target, &self.fig_id_map)
+            .handle(PlatformBoundEvent::Initialize, &self.fig_id_map)
             .expect("Failed to initialize platform state");
 
         {
@@ -140,7 +129,7 @@ impl WebviewManager {
             .ok();
 
         let tray_visible = !fastab_settings::settings::get_bool_or("app.hideMenubarIcon", false);
-        let tray = build_tray(&window_target, &self.figterm_state).await.unwrap();
+        let tray = build_tray(&self.figterm_state).await.unwrap();
         if let Err(err) = tray.set_visible(tray_visible) {
             error!(%err, "Failed to set tray visible");
         }
@@ -173,7 +162,6 @@ impl WebviewManager {
                 context,
                 show_dashboard_after_normal_launch,
                 proxy,
-                window_target,
                 overlay,
                 settings: None,
                 completion_settings: crate::settings_refresh::CompletionSettings::capture(
