@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::Parser;
 
 #[derive(Parser, Debug)]
@@ -21,6 +23,9 @@ pub struct Cli {
     /// Unregister launch at login and exit (used by the uninstaller)
     #[arg(long, hide = true)]
     pub unregister_login_item: bool,
+    /// Run only the Settings window, for the desktop app listening on this socket
+    #[arg(long, hide = true, value_name = "SOCKET")]
+    pub settings_window: Option<PathBuf>,
     /// Url to open
     pub url_link: Option<String>,
 }

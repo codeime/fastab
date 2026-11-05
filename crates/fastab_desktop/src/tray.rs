@@ -14,7 +14,7 @@ use tracing::{error, trace};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::event::{Event, ShowMessageNotification, WindowEvent};
-use crate::{AUTOCOMPLETE_ID, DASHBOARD_ID, EventLoopProxy, EventLoopWindowTarget};
+use crate::{AUTOCOMPLETE_ID, DASHBOARD_ID, EventLoopProxy};
 
 // macro_rules! icon {
 //     ($icon:literal) => {{
@@ -165,10 +165,7 @@ fn load_icon(path: impl AsRef<std::path::Path>) -> Option<Icon> {
     Icon::from_rgba(rgba, width, height).ok()
 }
 
-pub async fn build_tray(
-    _event_loop_window_target: &EventLoopWindowTarget,
-    _figterm_state: &FigtermState,
-) -> tray_icon::Result<TrayIcon> {
+pub async fn build_tray(_figterm_state: &FigtermState) -> tray_icon::Result<TrayIcon> {
     let is_logged_in = true; // fig_auth removed
     TrayIconBuilder::new()
         .with_icon(get_icon(is_logged_in))

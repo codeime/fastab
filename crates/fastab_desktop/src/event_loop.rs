@@ -8,7 +8,6 @@ use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
-use tao::platform::macos::ActivationPolicy;
 use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::event::Event;
@@ -483,22 +482,6 @@ impl OverlayInput {
             .saturating_add(self.buffer.capacity())
             .saturating_add(self.cwd.capacity())
     }
-}
-
-/// Stand-in for tao's window-target. Dashboard windows are created with AppKit directly; this
-/// type only carries activation-policy changes onto `NSApplication`.
-#[derive(Debug, Default, Clone, Copy)]
-pub struct EventLoopWindowTarget;
-
-impl EventLoopWindowTarget {
-    /// Apply an `NSApplicationActivationPolicy` at runtime.
-    #[cfg(target_os = "macos")]
-    pub fn set_activation_policy_at_runtime(&self, policy: ActivationPolicy) {
-        crate::platform::set_activation_policy(policy);
-    }
-
-    #[cfg(not(target_os = "macos"))]
-    pub fn set_activation_policy_at_runtime(&self, _policy: ActivationPolicy) {}
 }
 
 pub(crate) fn channel() -> (EventLoopProxy, EventLoopReceiver) {

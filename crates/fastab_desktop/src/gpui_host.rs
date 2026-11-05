@@ -1,5 +1,5 @@
-//! GPUI process host. Replaces tao's `EventLoop::run` so overlay and dashboard share one
-//! `NSApplication`.
+//! GPUI process host. Replaces tao's `EventLoop::run` so the overlay and the tray share one
+//! `NSApplication`. Settings runs elsewhere: see `settings_process`.
 
 use std::sync::Arc;
 use std::{cell::RefCell, rc::Rc};
@@ -15,13 +15,14 @@ use tracing::warn;
 use tracing::{debug, error, info, trace};
 use tray_icon::TrayIcon;
 
+use crate::EventLoopProxy;
 use crate::event::{Event, ShowMessageNotification, WindowEvent};
 use crate::event_loop::{InputSequence, OverlayInputDispatch, QueuedOverlayInput};
 use crate::overlay::OverlayController;
 use crate::platform::{PlatformBoundEvent, PlatformState};
+use crate::settings_process::{HostMessage, SettingsProcess};
 use crate::tray::{self, get_context_menu, get_icon};
 use crate::webview::{DASHBOARD_ID, FigIdMap, WindowId};
-use crate::{EventLoopProxy, EventLoopWindowTarget};
 use fastab_os_shim::Context;
 use fastab_remote_ipc::figterm::FigtermState;
 
@@ -128,9 +129,9 @@ pub struct DesktopHost {
     /// native settings gate is the in-app path that explains and repairs it.
     pub show_dashboard_after_normal_launch: bool,
     pub proxy: EventLoopProxy,
-    pub window_target: EventLoopWindowTarget,
     pub overlay: OverlayController,
-    pub settings: Option<crate::settings_ui::SettingsHandle>,
+    /// The last Settings process started. It may have exited since.
+    pub settings: Option<SettingsProcess>,
     pub completion_settings: crate::settings_refresh::CompletionSettings,
     pub tray: TrayIcon,
 }
@@ -188,18 +189,22 @@ impl DesktopHost {
                 let autocomplete_enabled = autocomplete_should_run();
                 self.overlay.apply_theme(cx);
                 self.overlay.set_enabled(autocomplete_enabled, cx);
-                self.refresh_settings_permissions(cx);
+                if let Some(settings) = &self.settings {
+                    settings.send(HostMessage::RefreshPermissions).ok();
+                }
+            },
+            Event::CheckForUpdates => {
+                tokio::spawn(async {
+                    crate::update::check_for_update(true, false).await;
+                });
             },
             Event::MenuClicked(id) => {
                 info!(%id, "Menu Event");
                 let menu_event = MenuEvent { id: muda::MenuId(id) };
                 tray::handle_event(&menu_event, &self.proxy);
             },
-            Event::PermissionSnapshot(snapshot) => {
-                if let Some(handle) = &self.settings {
-                    crate::settings_ui::apply_permission_snapshot(handle, snapshot, cx);
-                }
-            },
+            // Only the Settings process checks permissions, and it keeps the result.
+            Event::PermissionSnapshot(_) => {},
             Event::EngineDiagnostics { mut reply } => {
                 if reply.is_canceled() {
                     return;
@@ -309,10 +314,7 @@ impl DesktopHost {
                         invalidate_overlay_input_focus(&self.proxy, &mut self.overlay, sequence, cx);
                     }
                 }
-                if let Err(err) = self
-                    .platform_state
-                    .handle(native_event, &self.window_target, &self.fig_id_map)
-                {
+                if let Err(err) = self.platform_state.handle(native_event, &self.fig_id_map) {
                     debug!(%err, "Failed to handle native event");
                 }
             },
@@ -408,7 +410,7 @@ impl DesktopHost {
         cx: &mut App,
     ) {
         match window_id {
-            id if id == DASHBOARD_ID => self.dispatch_settings_event(window_event, cx),
+            id if id == DASHBOARD_ID => self.dispatch_settings_event(window_event),
             id if id == crate::webview::AUTOCOMPLETE_ID => match window_event {
                 WindowEvent::Hide | WindowEvent::Close => self.overlay.hide(cx),
                 WindowEvent::SetEnabled(enabled) => self.overlay.set_enabled(enabled, cx),
@@ -492,78 +494,41 @@ impl DesktopHost {
         }
     }
 
-    fn dispatch_settings_event(&mut self, window_event: WindowEvent, cx: &mut App) {
+    fn dispatch_settings_event(&mut self, window_event: WindowEvent) {
         match window_event {
-            WindowEvent::Show | WindowEvent::Devtools => self.show_settings(cx),
-            WindowEvent::Hide | WindowEvent::Close => self.close_settings(cx),
-            WindowEvent::NavigateRelative { path } => {
-                self.show_settings(cx);
-                if let Some(handle) = &self.settings {
-                    crate::settings_ui::set_settings_section(handle, path.as_ref(), cx);
+            WindowEvent::Show | WindowEvent::Devtools => self.show_settings(None),
+            WindowEvent::Hide | WindowEvent::Close => {
+                if let Some(settings) = &self.settings {
+                    settings.send(HostMessage::Close).ok();
                 }
             },
+            WindowEvent::NavigateRelative { path } => self.show_settings(Some(path.into_owned())),
             WindowEvent::Batch(events) => {
                 for event in events {
-                    self.dispatch_settings_event(event, cx);
+                    self.dispatch_settings_event(event);
                 }
             },
             other => trace!(?other, "Ignoring webview-only event on native settings"),
         }
     }
 
-    fn show_settings(&mut self, cx: &mut App) {
-        if let Some(handle) = &self.settings {
-            if crate::settings_ui::focus_settings(handle, cx) {
-                #[cfg(target_os = "macos")]
-                crate::webview::menu::restore_native(cx);
-                crate::settings_ui::notify_dashboard_visible(&self.proxy, true);
-                self.refresh_settings_permissions(cx);
-                return;
-            }
+    fn show_settings(&mut self, path: Option<String>) {
+        let mut message = HostMessage::Show { path };
+        if let Some(settings) = &self.settings {
+            message = match settings.send(message) {
+                Ok(()) => return,
+                Err(message) => message,
+            };
         }
-        match crate::settings_ui::open_settings_window(cx, self.proxy.clone()) {
-            Ok(handle) => {
-                self.settings = Some(handle);
-                #[cfg(target_os = "macos")]
-                crate::webview::menu::restore_native(cx);
-                crate::settings_ui::notify_dashboard_visible(&self.proxy, true);
-                self.refresh_settings_permissions(cx);
+        match SettingsProcess::launch(self.proxy.clone()) {
+            Ok(settings) => {
+                settings.send(message).ok();
+                self.settings = Some(settings);
             },
             Err(err) => {
-                error!(%err, "Failed to open native settings");
+                error!(%err, "Failed to start the Settings process");
                 self.settings = None;
-                self.retire_settings_menu(cx);
             },
-        }
-    }
-
-    fn refresh_settings_permissions(&self, cx: &mut App) {
-        if let Some(handle) = &self.settings {
-            crate::settings_ui::refresh_permission_check(handle, &self.proxy, cx);
-        }
-    }
-
-    fn close_settings(&mut self, cx: &mut App) {
-        if let Some(handle) = self.settings.take() {
-            crate::settings_ui::close_settings(&handle, cx);
-        }
-        self.retire_settings_menu(cx);
-    }
-
-    fn retire_settings_menu(&self, cx: &App) {
-        #[cfg(target_os = "macos")]
-        crate::webview::menu::retire_native(cx);
-        crate::settings_ui::notify_dashboard_visible(&self.proxy, false);
-    }
-
-    fn reconcile_closed_settings(&mut self, cx: &App) {
-        if self.settings.as_ref().is_some_and(|handle| {
-            !cx.windows()
-                .iter()
-                .any(|window| window.window_id() == handle.window_id())
-        }) {
-            self.settings = None;
-            self.retire_settings_menu(cx);
         }
     }
 }
@@ -655,19 +620,6 @@ pub fn start_application(
         Ok((host, event_rx)) => {
             *reopen_proxy.borrow_mut() = Some(host.read(cx).proxy.clone());
             fastab_gpui::install_idle_cache_release(cx, crate::heap_trim::note_activity);
-            #[cfg(target_os = "macos")]
-            crate::webview::menu::install_actions(cx, host.read(cx).proxy.clone());
-            let weak_host = host.downgrade();
-            cx.on_window_closed(move |cx| {
-                let weak_host = weak_host.clone();
-                // GPUI notifies before the removed Window finishes dropping.
-                // Recheck the current handle after that drop: an old close must
-                // not retire a newly opened settings window's menu.
-                cx.defer(move |cx| {
-                    let _ = weak_host.update(cx, |host, cx| host.reconcile_closed_settings(cx));
-                });
-            })
-            .detach();
             run(host.clone(), event_rx, cx);
             #[cfg(target_os = "macos")]
             {
@@ -678,12 +630,15 @@ pub fn start_application(
                 cx.spawn(async move |_| {
                     tokio::spawn(async move {
                         let input_method = InputMethod::default();
+                        // An open Settings window shows the input method's state.
                         match input_method.restore_if_chosen().await {
                             Ok(false) => {},
-                            Ok(true) => crate::permissions::spawn_check(&proxy),
+                            Ok(true) => {
+                                proxy.send_event(Event::ReloadAccessibility).ok();
+                            },
                             Err(err) => {
                                 warn!(%err, "Failed to restore the previously installed input method");
-                                crate::permissions::spawn_check(&proxy);
+                                proxy.send_event(Event::ReloadAccessibility).ok();
                             },
                         }
                         // The launch-time restore is a single check; keep the
@@ -697,7 +652,9 @@ pub fn start_application(
                 info!("{} has started", fastab_util::PRODUCT_NAME);
                 #[cfg(target_os = "macos")]
                 {
-                    crate::platform::set_activation_policy(*crate::platform::ACTIVATION_POLICY.lock().unwrap());
+                    // GPUI makes every app Regular as it finishes launching. This
+                    // process has no window that needs a Dock icon or a menu.
+                    crate::platform::set_activation_policy(tao::platform::macos::ActivationPolicy::Accessory);
                     // `--no-dashboard` and `app.silentLaunch` suppress only the
                     // normal dashboard request. Missing Accessibility is an
                     // intentional exception: without opening native settings,

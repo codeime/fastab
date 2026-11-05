@@ -1,7 +1,7 @@
 //! Native permission checks used by the settings gate (replaces the dashboard WebView gate).
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 
 use fastab_desktop_api::requests::install::install;
 use fastab_os_shim::{Context, ContextArcProvider, ContextProvider};
@@ -18,6 +18,7 @@ use crate::EventLoopProxy;
 use crate::event::Event;
 
 static NEXT_PERMISSION_GENERATION: AtomicU64 = AtomicU64::new(1);
+static RUNNING_REPAIRS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermId {
@@ -254,6 +255,38 @@ fn next_permission_generation() -> u64 {
     NEXT_PERMISSION_GENERATION.fetch_add(1, Ordering::Relaxed)
 }
 
+/// Counts a repair for [`repair_is_running`] for as long as it is held.
+struct RunningRepair;
+
+impl RunningRepair {
+    fn begin() -> Self {
+        RUNNING_REPAIRS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for RunningRepair {
+    fn drop(&mut self) {
+        RUNNING_REPAIRS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// Whether a repair, or the Accessibility guide one started, still needs this
+/// process. Closing the window does not stop either.
+pub fn repair_is_running() -> bool {
+    if RUNNING_REPAIRS.load(Ordering::Relaxed) > 0 {
+        return true;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_utils::accessibility::accessibility_guide_is_active()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
 async fn publish_check(proxy: &EventLoopProxy, completes_repair: bool, generation: u64, repair_error: Option<String>) {
     let mut required = check_required().await;
     required.generation = generation;
@@ -275,7 +308,9 @@ async fn publish_check(proxy: &EventLoopProxy, completes_repair: bool, generatio
 pub fn spawn_repair(proxy: &EventLoopProxy, id: PermId) -> u64 {
     let proxy = proxy.clone();
     let generation = next_permission_generation();
+    let running = RunningRepair::begin();
     tokio::spawn(async move {
+        let _running = running;
         let repair_error = repair(id).await.err();
         if let Some(err) = &repair_error {
             warn!(?id, %err, "permission repair failed");
@@ -289,7 +324,9 @@ pub fn spawn_repair(proxy: &EventLoopProxy, id: PermId) -> u64 {
 pub fn spawn_repair_all(proxy: &EventLoopProxy) -> u64 {
     let proxy = proxy.clone();
     let generation = next_permission_generation();
+    let running = RunningRepair::begin();
     tokio::spawn(async move {
+        let _running = running;
         let repair_error = repair_all().await.err();
         if let Some(err) = &repair_error {
             warn!(%err, "permission repair-all failed");

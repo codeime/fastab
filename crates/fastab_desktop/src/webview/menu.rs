@@ -10,6 +10,7 @@ mod macos {
     use fastab_util::consts::PRODUCT_NAME;
     use fastab_util::consts::url::{ISSUE_TRACKER, RELEASE_NOTES, USER_MANUAL};
     use gpui::{App, KeyBinding, Menu, MenuItem, OsAction, SystemMenuType, actions};
+    use tao::event_loop::ControlFlow;
 
     use super::{Copy, Cut, Paste, Redo, SelectAll, Undo};
     use crate::event::{Event, WindowEvent};
@@ -95,19 +96,21 @@ mod macos {
                 ]),
             );
         });
-        cx.on_action(|_: &CheckForUpdates, _| {
-            tokio::spawn(async {
-                let _ = crate::update::check_for_update(true, true).await;
-            });
+        let updates_proxy = proxy.clone();
+        cx.on_action(move |_: &CheckForUpdates, _| {
+            updates_proxy.send_event(Event::CheckForUpdates).ok();
         });
         cx.on_action(|_: &OpenGithub, _| open_link(USER_MANUAL));
         cx.on_action(|_: &OpenReleaseNotes, _| open_link(RELEASE_NOTES));
         cx.on_action(|_: &ReportIssue, _| open_link(ISSUE_TRACKER));
-        cx.on_action(move |_: &CloseWindow, _| send_settings_event(&proxy, WindowEvent::Close));
+        let close_proxy = proxy.clone();
+        cx.on_action(move |_: &CloseWindow, _| send_settings_event(&close_proxy, WindowEvent::Close));
         cx.on_action(|_: &Hide, cx| cx.hide());
         cx.on_action(|_: &HideOthers, cx| cx.hide_other_apps());
         cx.on_action(|_: &ShowAll, cx| cx.unhide_other_apps());
-        cx.on_action(|_: &Quit, cx| cx.quit());
+        cx.on_action(move |_: &Quit, _| {
+            proxy.send_event(Event::ControlFlow(ControlFlow::Exit)).ok();
+        });
         cx.on_action(bring_all_to_front);
 
         cx.bind_keys([
@@ -125,10 +128,7 @@ mod macos {
         ]);
     }
 
-    pub(super) fn restore_native(cx: &App) {
-        if cx.get_menus().is_some() {
-            return;
-        }
+    pub(super) fn install_native(cx: &App) {
         cx.set_menus(vec![
             Menu {
                 name: PRODUCT_NAME.into(),
@@ -183,14 +183,6 @@ mod macos {
         ]);
         finish_native_menu();
     }
-
-    pub(super) fn retire_native(cx: &App) {
-        if cx.get_menus().is_some() {
-            // GPUI detaches all three NSApplication owners and releases the
-            // matching action registry. AppKit may retain its own display caches.
-            cx.set_menus(Vec::new());
-        }
-    }
 }
 
 #[cfg(target_os = "macos")]
@@ -202,11 +194,6 @@ pub fn install_actions(cx: &mut gpui::App, proxy: crate::EventLoopProxy) {
 }
 
 #[cfg(target_os = "macos")]
-pub fn restore_native(cx: &gpui::App) {
-    macos::restore_native(cx);
-}
-
-#[cfg(target_os = "macos")]
-pub fn retire_native(cx: &gpui::App) {
-    macos::retire_native(cx);
+pub fn install_native(cx: &gpui::App) {
+    macos::install_native(cx);
 }

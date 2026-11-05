@@ -363,6 +363,17 @@ jobs:
           table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/cold-load.txt)"
           echo "::notice title=cold completion (ms)::${table}"
 
+      # A hosted runner may have no Metal device, so this reports and does not
+      # gate. The notice carries the window's footprint and how long each exit took.
+      - name: Exercise the Settings process
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        continue-on-error: true
+        run: |
+          python3 scripts/settings-process-smoke.py target/dist/fastab 2>&1 | tee target/settings-process.txt
+          table="$(awk '{ gsub(/%/, "%25"); printf "%s%%0A", $0 }' target/settings-process.txt)"
+          echo "::notice title=settings process::${table}"
+          grep -q '^PASS$' target/settings-process.txt
+
       # What the engine leaves in the heap, with the allocator setting the desktop
       # and fterm start with and without it. Engine only, so no frameworks.
       - name: Measure engine memory

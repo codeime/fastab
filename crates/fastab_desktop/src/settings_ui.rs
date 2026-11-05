@@ -3,7 +3,6 @@
 #![allow(unexpected_cfgs)]
 
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use gpui::prelude::*;
@@ -17,17 +16,10 @@ use tracing::error;
 use crate::EventLoopProxy;
 use crate::event::Event;
 use crate::permissions::{self, PermId, PermReady, PermissionSnapshot};
-use crate::platform::PlatformBoundEvent;
 #[cfg(target_os = "macos")]
 use crate::webview::menu::{Minimize, Zoom};
 
 pub const SETTINGS_WINDOW_TITLE: &str = "Settings";
-
-static SETTINGS_OPEN: AtomicBool = AtomicBool::new(false);
-
-pub fn is_open() -> bool {
-    SETTINGS_OPEN.load(Ordering::Relaxed)
-}
 
 const SIDEBAR_W: f32 = 196.0;
 const SETTINGS_TITLEBAR_H: f32 = 44.0;
@@ -1530,11 +1522,8 @@ fn about_page(zh: bool, chrome: Chrome, entity: Entity<SettingsWindow>, copied_d
                                 "Check for Updates".to_string()
                             },
                             chrome,
-                            move |_cx| {
-                                let _ = entity_updates;
-                                tokio::spawn(async {
-                                    crate::update::check_for_update(true, false).await;
-                                });
+                            move |cx| {
+                                entity_updates.read(cx).proxy.send_event(Event::CheckForUpdates).ok();
                             },
                         )),
                 ),
@@ -2429,16 +2418,6 @@ pub fn set_settings_section(handle: &SettingsHandle, path: &str, cx: &mut App) {
             view.theme_controls.menu = None;
             cx.notify();
         })
-        .ok();
-}
-
-pub fn notify_dashboard_visible(proxy: &EventLoopProxy, visible: bool) {
-    SETTINGS_OPEN.store(visible, Ordering::Relaxed);
-    proxy
-        .send_event(Event::PlatformBoundEvent(PlatformBoundEvent::FullscreenStateUpdated {
-            fullscreen: false,
-            dashboard_visible: Some(visible),
-        }))
         .ok();
 }
 

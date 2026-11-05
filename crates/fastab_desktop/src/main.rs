@@ -10,6 +10,7 @@ mod overlay;
 #[cfg(test)]
 mod overlay_session;
 mod permissions;
+mod settings_process;
 mod settings_refresh;
 mod settings_ui;
 // mod figterm;
@@ -47,7 +48,7 @@ use url::Url;
 use webview::WebviewManager;
 pub use webview::{AUTOCOMPLETE_ID, AUTOCOMPLETE_WINDOW_TITLE, DASHBOARD_ID};
 
-pub use event_loop::{EventLoopClosed, EventLoopProxy, EventLoopWindowTarget};
+pub use event_loop::{EventLoopClosed, EventLoopProxy};
 
 /// What the async prelude hands back so GPUI can be started from plain `main`.
 struct Launch {
@@ -59,6 +60,7 @@ struct Launch {
 fn main() -> ExitCode {
     fastab_util::malloc::clear_space_efficient();
     fastab_util::build_identity::initialize();
+    let cli = cli::Cli::parse();
     // The desktop process is I/O bound: GPUI owns the UI thread, and the
     // completion engine has its own worker. A worker per core just parks
     // stacks — the same waste ecterm already stopped.
@@ -70,14 +72,18 @@ fn main() -> ExitCode {
         .build()
         .expect("tokio runtime");
 
+    if let Some(socket) = &cli.settings_window {
+        return settings_process::run_window_process(socket, &runtime);
+    }
+
     // The prelude runs on this thread before AppKit starts managing event
     // pools. Drain its temporaries before entering the long-lived UI loop.
     // `block_on` polls its root future here; the pool never migrates with a
     // spawned worker future or spans `NSApplication::run`.
     #[cfg(target_os = "macos")]
-    let launch = objc2::rc::autoreleasepool(|_| runtime.block_on(async_main()));
+    let launch = objc2::rc::autoreleasepool(|_| runtime.block_on(async_main(cli)));
     #[cfg(not(target_os = "macos"))]
-    let launch = runtime.block_on(async_main());
+    let launch = runtime.block_on(async_main(cli));
     let Launch { setup, _log_guard } = match launch {
         Ok(launch) => launch,
         Err(exit_code) => return exit_code,
@@ -137,11 +143,9 @@ fn raise_open_file_limit() {
 
 /// Everything that has to happen before the UI loop starts. `Err` carries the
 /// exit code for the paths that stop short of launching.
-async fn async_main() -> Result<Launch, ExitCode> {
+async fn async_main(cli: cli::Cli) -> Result<Launch, ExitCode> {
     #[cfg(target_os = "macos")]
     gpui_host::ensure_gpui_ns_application();
-
-    let cli = cli::Cli::parse();
 
     #[cfg(target_os = "macos")]
     if cli.unregister_login_item {
@@ -306,9 +310,8 @@ async fn async_main() -> Result<Launch, ExitCode> {
         && fastab_integrations::login_item::supports_modern_login_item();
     #[cfg(not(target_os = "macos"))]
     let defer_dashboard_for_modern_login_item = false;
-    let visible = !cli.no_dashboard && !silent_launch && !defer_dashboard_for_modern_login_item;
 
-    let webview_manager = WebviewManager::new(ctx, visible, defer_dashboard_for_modern_login_item);
+    let webview_manager = WebviewManager::new(ctx, defer_dashboard_for_modern_login_item);
     let auto_updates_enabled = !fastab_settings::settings::get_bool_or("app.disableAutoupdates", false);
     if auto_updates_enabled {
         // start_automatic_checks dispatches to the main thread asynchronously,

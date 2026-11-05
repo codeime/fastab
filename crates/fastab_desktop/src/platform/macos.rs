@@ -33,7 +33,7 @@ use super::{PlatformBoundEvent, PlatformWindow};
 use crate::event::{Event, WindowEvent, WindowPosition};
 use crate::utils::Rect;
 use crate::webview::{FigIdMap, WindowId};
-use crate::{AUTOCOMPLETE_ID, AUTOCOMPLETE_WINDOW_TITLE, DASHBOARD_ID, EventLoopProxy, EventLoopWindowTarget};
+use crate::{AUTOCOMPLETE_ID, AUTOCOMPLETE_WINDOW_TITLE, EventLoopProxy};
 
 pub const DEFAULT_CARET_WIDTH: f64 = 10.0;
 
@@ -106,8 +106,6 @@ static MACOS_VERSION: LazyLock<semver::Version> = LazyLock::new(|| {
     let version = macos_utils::os::OperatingSystemVersion::get();
     semver::Version::new(version.major() as u64, version.minor() as u64, version.patch() as u64)
 });
-
-pub static ACTIVATION_POLICY: Mutex<ActivationPolicy> = Mutex::new(ActivationPolicy::Regular);
 
 #[allow(dead_code)]
 pub fn activate_app() {
@@ -469,12 +467,7 @@ impl PlatformStateImpl {
         }
     }
 
-    pub(super) fn handle(
-        self: &Arc<Self>,
-        event: PlatformBoundEvent,
-        window_target: &EventLoopWindowTarget,
-        window_map: &FigIdMap,
-    ) -> anyhow::Result<()> {
+    pub(super) fn handle(self: &Arc<Self>, event: PlatformBoundEvent, window_map: &FigIdMap) -> anyhow::Result<()> {
         match &event {
             PlatformBoundEvent::FocusedElementChanged { app, .. } => {
                 // UIElement's Debug implementation asks AX for its role and frame. Keep
@@ -542,17 +535,11 @@ impl PlatformStateImpl {
                             WindowServerEvent::WindowDestroyed { app } => {
                                 events.push(Event::PlatformBoundEvent(PlatformBoundEvent::WindowDestroyed { app }));
                             },
-                            WindowServerEvent::ActiveSpaceChanged { is_fullscreen } => {
-                                events.extend([
-                                    Event::WindowEvent {
-                                        window_id: AUTOCOMPLETE_ID.clone(),
-                                        window_event: WindowEvent::Hide,
-                                    },
-                                    Event::PlatformBoundEvent(PlatformBoundEvent::FullscreenStateUpdated {
-                                        fullscreen: is_fullscreen,
-                                        dashboard_visible: None,
-                                    }),
-                                ]);
+                            WindowServerEvent::ActiveSpaceChanged { .. } => {
+                                events.push(Event::WindowEvent {
+                                    window_id: AUTOCOMPLETE_ID.clone(),
+                                    window_event: WindowEvent::Hide,
+                                });
                             },
                             WindowServerEvent::RequestCaretPositionUpdate { app, window_id } => {
                                 events.push(Event::PlatformBoundEvent(
@@ -650,30 +637,6 @@ impl PlatformStateImpl {
                 }
                 Ok(())
             },
-            PlatformBoundEvent::FullscreenStateUpdated {
-                fullscreen,
-                dashboard_visible,
-            } => {
-                let policy = if fullscreen {
-                    ActivationPolicy::Accessory
-                } else {
-                    let dashboard_visible = dashboard_visible.unwrap_or_else(crate::settings_ui::is_open);
-
-                    if dashboard_visible {
-                        ActivationPolicy::Regular
-                    } else {
-                        ActivationPolicy::Accessory
-                    }
-                };
-
-                let mut policy_lock = ACTIVATION_POLICY.lock().unwrap();
-                if *policy_lock != policy {
-                    debug!(?policy, "Setting application policy");
-                    *policy_lock = policy;
-                    window_target.set_activation_policy_at_runtime(policy);
-                }
-                Ok(())
-            },
             PlatformBoundEvent::AccessibilityUpdateRequested => {
                 let proxy = self.proxy.clone();
                 tokio::runtime::Handle::current().spawn(async move {
@@ -715,24 +678,6 @@ impl PlatformStateImpl {
 
                 self.proxy.send_event(Event::ReloadAccessibility).ok();
 
-                Ok(())
-            },
-            PlatformBoundEvent::AppWindowFocusChanged {
-                window_id,
-                focused,
-                fullscreen,
-                visible,
-            } => {
-                // Update activation policy
-                if window_id == DASHBOARD_ID && focused {
-                    debug!("Sending FullscreenStateUpdated");
-                    self.proxy
-                        .send_event(Event::PlatformBoundEvent(PlatformBoundEvent::FullscreenStateUpdated {
-                            fullscreen,
-                            dashboard_visible: Some(visible),
-                        }))
-                        .ok();
-                }
                 Ok(())
             },
             PlatformBoundEvent::FocusedElementChanged { element, app } => {

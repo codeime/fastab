@@ -124,8 +124,9 @@ pub fn current_exe_origin() -> Result<PathBuf, Error> {
     Ok(std::env::current_exe()?.canonicalize()?)
 }
 
+/// The bundle this executable runs from, if it does run from one.
 #[must_use]
-fn app_bundle_path_opt() -> Option<PathBuf> {
+pub fn app_bundle_path_opt() -> Option<PathBuf> {
     use consts::macos::BUNDLE_CONTENTS_MACOS_PATH;
 
     let current_exe = current_exe_origin().ok()?;

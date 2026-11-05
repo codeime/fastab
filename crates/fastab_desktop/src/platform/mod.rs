@@ -5,9 +5,9 @@ use macos_utils::window_server::ApplicationSpecifier;
 use serde::Serialize;
 use tao::dpi::Position;
 
+use crate::EventLoopProxy;
 use crate::utils::Rect;
 use crate::webview::{FigIdMap, WindowId};
-use crate::{EventLoopProxy, EventLoopWindowTarget};
 
 cfg_if::cfg_if! {
     if #[cfg(target_os = "linux")] {
@@ -43,13 +43,8 @@ impl PlatformState {
     }
 
     /// Handle a [`PlatformBoundEvent`]
-    pub fn handle(
-        self: &Arc<Self>,
-        event: PlatformBoundEvent,
-        window_target: &EventLoopWindowTarget,
-        window_map: &FigIdMap,
-    ) -> anyhow::Result<()> {
-        self.clone().0.handle(event, window_target, window_map)
+    pub fn handle(self: &Arc<Self>, event: PlatformBoundEvent, window_map: &FigIdMap) -> anyhow::Result<()> {
+        self.clone().0.handle(event, window_map)
     }
 
     /// Position the window at the given coordinates
@@ -88,20 +83,10 @@ pub enum PlatformBoundEvent {
     /// Late initialization after the event loop has started
     InitializePostRun,
     EditBufferChanged,
-    FullscreenStateUpdated {
-        fullscreen: bool,
-        dashboard_visible: Option<bool>,
-    },
     AccessibilityUpdated {
         enabled: bool,
     },
     AccessibilityUpdateRequested,
-    AppWindowFocusChanged {
-        window_id: WindowId,
-        focused: bool,
-        fullscreen: bool,
-        visible: bool,
-    },
     #[cfg(target_os = "macos")]
     CaretPositionUpdateRequested {
         app: ApplicationSpecifier,

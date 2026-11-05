@@ -42,6 +42,9 @@ pub enum Event {
     },
     JevContextChanged,
     ReloadAccessibility,
+    /// Someone asked for an update check. Sparkle lives in the desktop app, so
+    /// the Settings process passes this on.
+    CheckForUpdates,
     ReloadTray {
         is_logged_in: bool,
     },
