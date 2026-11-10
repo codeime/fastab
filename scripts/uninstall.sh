@@ -139,16 +139,43 @@ done
 # This fallback removes only Fastab lines.
 info "Verifying shell integration removal..."
 
+# Puts "$2" in place of "$1"'s contents and removes "$2". The file is written
+# through, not renamed over: `mv` of a temp file replaced a dotfile manager's
+# symlink (stow, chezmoi, yadm) with a plain copy and reset the mode to
+# mktemp's 0600.
+write_back() {
+  local file="$1" new="$2"
+  if ! cat "$new" > "$file"; then
+    warn "Could not update ${file}; remove the FasTab lines from it by hand."
+  fi
+  rm -f "$new"
+}
+
+# Writes the lines of "$2" that do not match "$1" to "$3". Fails only when the
+# file could not be read: grep's status 1 just means no line was left, while
+# its empty output after a read error must never be written back.
+without_matching_lines() {
+  local pattern="$1" file="$2" out="$3" status=0
+  grep -Ev "$pattern" "$file" > "$out" || status=$?
+  [[ "$status" -le 1 ]]
+}
+
+SHELL_INTEGRATION_LINES='Fastab (pre|post) block|fastab/shell/(zshrc|zprofile|bashrc|bash_profile)\.(pre|post)\.(zsh|bash)|eval "\$\((~/.local/bin/)?ftab init |eval \((~/.local/bin/)?ftab init |\[ -x ~/.local/bin/ftab \] && eval |command -v ftab >/dev/null 2>&1 && eval '
+
 strip_shell_integration_fallback() {
   local rc_file="$1"
   [[ -f "$rc_file" ]] || return 0
+  # Nothing of ours left: leave the file exactly as it is.
+  grep -Eq "$SHELL_INTEGRATION_LINES" "$rc_file" || return 0
 
   local tmp
   tmp="$(mktemp)"
-  grep -Ev \
-    'Fastab (pre|post) block|fastab/shell/(zshrc|zprofile|bashrc|bash_profile)\.(pre|post)\.(zsh|bash)|eval "\$\((~/.local/bin/)?ftab init |eval \((~/.local/bin/)?ftab init |\[ -x ~/.local/bin/ftab \] && eval |command -v ftab >/dev/null 2>&1 && eval ' \
-    "$rc_file" > "$tmp" || true
-  mv "$tmp" "$rc_file"
+  if without_matching_lines "$SHELL_INTEGRATION_LINES" "$rc_file" "$tmp"; then
+    write_back "$rc_file" "$tmp"
+  else
+    rm -f "$tmp"
+    warn "Could not read ${rc_file}; left as it is."
+  fi
 }
 
 strip_shell_integration_fallback "${HOME}/.zshrc"
@@ -160,17 +187,22 @@ strip_shell_integration_fallback "${HOME}/.config/fish/config.fish"
 # Fish dedicated conf files are still named 00_fig_pre.fish / 99_fig_post.fish.
 # Easy Complete / Amazon Q / Fig use the same names. Always strip Fastab hook
 # lines only — never delete the file while any other content remains.
+FISH_CONF_LINES='ftab init|/\.local/bin/ftab|command -v ftab >/dev/null|command -qv ftab |fastab/shell/|^[[:space:]]*# Fastab '
+
 maybe_remove_fastab_fish_conf() {
   local path="$1"
   [[ -f "$path" ]] || return 0
+  grep -Eq "$FISH_CONF_LINES" "$path" || return 0
+
   local tmp
   tmp="$(mktemp)"
-  grep -Ev 'ftab init|/\.local/bin/ftab|command -v ftab >/dev/null|command -qv ftab |fastab/shell/|^[[:space:]]*# Fastab ' \
-    "$path" > "$tmp" || true
-  if ! grep -Eq '[^[:space:]]' "$tmp"; then
+  if ! without_matching_lines "$FISH_CONF_LINES" "$path" "$tmp"; then
+    rm -f "$tmp"
+    warn "Could not read ${path}; left as it is."
+  elif ! grep -Eq '[^[:space:]]' "$tmp"; then
     rm -f "$path" "$tmp"
   else
-    mv "$tmp" "$path"
+    write_back "$path" "$tmp"
   fi
 }
 maybe_remove_fastab_fish_conf "${HOME}/.config/fish/conf.d/00_fig_pre.fish"
@@ -183,9 +215,11 @@ maybe_remove_fastab_fish_conf "${HOME}/.config/fish/conf.d/99_fig_post.fish"
 strip_fastab_ssh_config() {
   local ssh_config="${HOME}/.ssh/config"
   [[ -f "$ssh_config" ]] || return 0
+  grep -q '^# Fastab SSH Integration' "$ssh_config" || return 0
+
   local tmp
   tmp="$(mktemp)"
-  awk '
+  if awk '
     function flush() {
       if (held != "") print held
       held = ""
@@ -196,8 +230,12 @@ strip_fastab_ssh_config() {
     pending == 2 && $0 ~ /Include/ && $0 ~ /fastab\/ssh/ { held = ""; pending = 0; next }
     { flush(); print }
     END { flush() }
-  ' "$ssh_config" > "$tmp"
-  mv "$tmp" "$ssh_config"
+  ' "$ssh_config" > "$tmp"; then
+    write_back "$ssh_config" "$tmp"
+  else
+    rm -f "$tmp"
+    warn "Could not read ${ssh_config}; left as it is."
+  fi
 }
 strip_fastab_ssh_config
 
