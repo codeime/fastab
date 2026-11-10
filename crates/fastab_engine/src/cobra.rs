@@ -137,7 +137,9 @@ fn resolve_binary(name: &str, cwd: &str) -> Option<PathBuf> {
         };
         return resolved.is_file().then_some(resolved);
     }
-    let search = std::env::var_os("PATH")?;
+    // The terminal's `PATH`, not the desktop app's: a binary the user can run
+    // is usually not in the system directories LaunchServices starts us with.
+    let search = process::search_path()?;
     for dir in std::env::split_paths(&search) {
         let candidate = dir.join(name);
         if candidate.is_file() {

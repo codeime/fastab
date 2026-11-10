@@ -10,7 +10,9 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value as JsonValue;
 
-use crate::hook_types::{HookContext, HookDiagnostic, HookDiagnosticRecord, ScriptCommand, ShellContext};
+use crate::hook_types::{
+    HookContext, HookDiagnostic, HookDiagnosticRecord, HookEnvironment, ScriptCommand, ShellContext,
+};
 use crate::ir::Spec;
 use crate::process::{self, CommandError};
 use crate::runtime::Suggestion;
@@ -369,6 +371,17 @@ pub fn current_cwd() -> Option<String> {
 
 pub fn current_shell() -> ShellContext {
     session_shell()
+}
+
+/// The exports of the terminal session this thread is completing for. Empty
+/// outside a request, and until the session has reported them.
+pub(crate) fn session_environment() -> HookEnvironment {
+    SHELL.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .map(|shell| shell.environment_variables.clone())
+            .unwrap_or_default()
+    })
 }
 
 fn finish_option<T>(hook_id: &str, value: Option<T>, empty: impl Fn(&T) -> bool) -> Option<T> {

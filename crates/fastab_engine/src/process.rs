@@ -1,9 +1,132 @@
 //! Timed subprocess helper for generators. Never run this on the UI thread.
 
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 
+use crate::hook_types::HookEnvironment;
+
 const MAX_STDOUT: usize = 256 * 1024;
+
+/// What a command a generator runs starts with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildEnvironment {
+    /// The terminal session's exports, when the request carries them.
+    Session,
+    /// This process's own environment, whatever the session exports. For a
+    /// shell that is run to work out its own environment.
+    Inherited,
+}
+
+/// Variables fterm took out of a generator command's environment, so that its
+/// output is plain text whatever the user's shell asks of interactive tools.
+const REMOVED_VARIABLES: [&str; 4] = ["LS_COLORS", "CLICOLOR_FORCE", "CLICOLOR", "COLORTERM"];
+/// Variables fterm set on every generator command.
+const FIXED_VARIABLES: [(&str, &str); 5] = [
+    ("PROCESS_LAUNCHED_BY_Q", "1"),
+    ("HISTFILE", ""),
+    ("HISTCONTROL", "ignoreboth"),
+    ("TERM", "xterm-256color"),
+    ("NO_COLOR", "1"),
+];
+
+/// The command a generator runs, in the environment of the terminal it
+/// completes for.
+///
+/// The desktop app is started by LaunchServices with `PATH=/usr/bin:/bin:
+/// /usr/sbin:/sbin` and none of the user's exports. The WebView sent these
+/// commands to fterm (`RunProcess`), which ran them with the shell's exports;
+/// run from here with the app's own environment, `brew`, `docker`, `kubectl`
+/// and anything else outside the system directories was not found, and
+/// `KUBECONFIG`, `AWS_PROFILE` and the like never reached the ones that were.
+/// This builds the command as fterm's `create_command` did: the program is
+/// looked up on the session's `PATH`, the environment is the session's
+/// exports, and the same few variables are removed and set.
+///
+/// A session's exports always include `PATH`. A list without it is not a
+/// shell's environment (nothing reported yet, or a caller that passes a few
+/// variables for hooks to read), and replacing the environment with it would
+/// leave the command without one, so such a command starts as it always has,
+/// with this process's environment untouched.
+fn command_for(command: &str, cwd: &str, environment: ChildEnvironment) -> Command {
+    let session = match environment {
+        ChildEnvironment::Session => crate::hook_backend::session_environment(),
+        ChildEnvironment::Inherited => HookEnvironment::default(),
+    };
+    let Some(search_path) = session.get("PATH") else {
+        return Command::new(command);
+    };
+    let mut cmd = match resolve_on_path(command, search_path, cwd) {
+        Some(program) => Command::new(program),
+        // Left to the spawn, which searches the same `PATH` and fails.
+        None => Command::new(command),
+    };
+    cmd.env_clear();
+    for (name, value) in session.as_slice() {
+        if is_valid_variable(name, value) {
+            cmd.env(name, value);
+        }
+    }
+    for name in REMOVED_VARIABLES {
+        cmd.env_remove(name);
+    }
+    cmd.envs(FIXED_VARIABLES);
+    cmd
+}
+
+/// The exports arrive over a local socket. One name or value the kernel cannot
+/// take must not fail every command of the session.
+fn is_valid_variable(name: &str, value: &str) -> bool {
+    !name.is_empty() && !name.contains(['=', '\0']) && !value.contains('\0')
+}
+
+/// The `PATH` a command typed in the terminal is looked up on: the session's
+/// when the request carries its exports, else this process's.
+pub(crate) fn search_path() -> Option<std::ffi::OsString> {
+    crate::hook_backend::session_environment()
+        .get("PATH")
+        .map(std::ffi::OsString::from)
+        .or_else(|| std::env::var_os("PATH"))
+}
+
+/// The first executable named `command` on `search_path`, as the shell would
+/// find it from `cwd`. A name with a slash is a path already and is not
+/// searched for.
+fn resolve_on_path(command: &str, search_path: &str, cwd: &str) -> Option<PathBuf> {
+    if command.is_empty() || command.contains('/') {
+        return None;
+    }
+    std::env::split_paths(search_path)
+        .filter_map(|dir| {
+            if dir.is_absolute() {
+                Some(dir)
+            } else if cwd.is_empty() {
+                // A relative entry (an empty one is the working directory)
+                // means nothing without the terminal's directory.
+                None
+            } else {
+                Some(Path::new(cwd).join(dir))
+            }
+        })
+        .map(|dir| dir.join(command))
+        .find(|candidate| is_executable_file(candidate))
+}
+
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+
+    let Ok(c_path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    // SAFETY: `c_path` is a NUL-terminated path that outlives the call.
+    path.is_file() && unsafe { libc::access(c_path.as_ptr(), libc::X_OK) } == 0
+}
+
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
+}
 
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum RunResult {
@@ -49,7 +172,7 @@ pub fn execute_full(
     if let Some(result) = mock::intercept_full(command, args, timeout) {
         return result;
     }
-    let mut cmd = Command::new(command);
+    let mut cmd = command_for(command, cwd, ChildEnvironment::Session);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -299,8 +422,14 @@ pub fn try_execute_isolated(command: &str, args: &[String], cwd: &str, timeout: 
 /// Isolated execution that also treats a non-zero exit status as failure.
 /// History commands use this contract so a broken custom source falls back
 /// to the database even if it printed diagnostics on stdout first.
+///
+/// Its callers run a shell to list what that shell finds for itself (the
+/// commands on a login shell's `PATH`, a custom history source), so it starts
+/// with this process's environment and not the session's: a login shell given
+/// the session's `Q_TERM` and `QTERM_SESSION_ID` would source the Fastab shims
+/// as that session and report its own environment back to fterm.
 pub fn try_execute_isolated_success(command: &str, args: &[String], cwd: &str, timeout: Duration) -> Option<String> {
-    match run(command, args, cwd, timeout, true, true) {
+    match run_in(ChildEnvironment::Inherited, command, args, cwd, timeout, true, true) {
         RunResult::Output(stdout) => Some(stdout),
         RunResult::TimedOut | RunResult::Cancelled | RunResult::Failed => None,
     }
@@ -321,6 +450,26 @@ fn run(
     isolated: bool,
     require_success: bool,
 ) -> RunResult {
+    run_in(
+        ChildEnvironment::Session,
+        command,
+        args,
+        cwd,
+        timeout,
+        isolated,
+        require_success,
+    )
+}
+
+fn run_in(
+    environment: ChildEnvironment,
+    command: &str,
+    args: &[String],
+    cwd: &str,
+    timeout: Duration,
+    isolated: bool,
+    require_success: bool,
+) -> RunResult {
     if crate::cancellation::is_cancelled() {
         return RunResult::Cancelled;
     }
@@ -331,7 +480,7 @@ fn run(
     if let Some(result) = mock::intercept_run(command, args, timeout, require_success) {
         return result;
     }
-    let mut cmd = Command::new(command);
+    let mut cmd = command_for(command, cwd, environment);
     cmd.args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1167,5 +1316,183 @@ mod tests {
             ),
             None
         );
+    }
+
+    /// Runs `run` as a completion for a terminal session exporting `variables`.
+    #[cfg(unix)]
+    fn in_session<R>(variables: &[(&str, &str)], run: impl FnOnce() -> R) -> R {
+        let exports: Vec<(String, String)> = variables
+            .iter()
+            .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+            .collect();
+        let shell = crate::hook_types::ShellContext {
+            current_process: "zsh".into(),
+            environment_variables: std::sync::Arc::new(exports).into(),
+        };
+        crate::hook_backend::enter_context("/", &shell, run)
+    }
+
+    /// A directory holding `name` as a link to `target`: a program that is on
+    /// no `PATH` but the one a test hands the session. A link, not a written
+    /// script, so nothing ever holds the file open for writing while another
+    /// test forks.
+    #[cfg(unix)]
+    fn directory_linking(name: &str, target: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(target, dir.path().join(name)).unwrap();
+        dir
+    }
+
+    /// `env`'s output, by name.
+    #[cfg(unix)]
+    fn printed_variables(output: &str) -> std::collections::BTreeMap<&str, &str> {
+        output.lines().filter_map(|line| line.split_once('=')).collect()
+    }
+
+    /// The desktop app's own `PATH` is the four system directories, so a
+    /// generator's command has to be found, and run, as the terminal would.
+    #[cfg(unix)]
+    #[test]
+    fn a_generator_command_is_found_and_run_in_the_sessions_environment() {
+        let dir = directory_linking("fastab-session-env", "/usr/bin/env");
+        let path = format!("{}:/usr/bin:/bin", dir.path().display());
+        let timeout = Duration::from_secs(5);
+
+        assert_eq!(
+            execute("fastab-session-env", &[], "/", timeout),
+            "",
+            "outside a session the name is on no PATH"
+        );
+        let session = [
+            ("PATH", path.as_str()),
+            ("SESSION_ONLY", "yes"),
+            ("CLICOLOR_FORCE", "1"),
+            ("TERM", "dumb"),
+            ("BAD=NAME", "dropped"),
+        ];
+        in_session(&session, || {
+            let full = execute_full("fastab-session-env", &[], "/", &[], timeout).unwrap();
+            assert_eq!(full.status, 0);
+            let outputs = [
+                execute("fastab-session-env", &[], "/", timeout),
+                try_execute("fastab-session-env", &[], "/", timeout).unwrap_or_default(),
+                try_execute_isolated("fastab-session-env", &[], "/", timeout).unwrap_or_default(),
+                full.stdout,
+            ];
+            for output in &outputs {
+                let variables = printed_variables(output);
+                for (name, value) in [
+                    ("PATH", path.as_str()),
+                    ("SESSION_ONLY", "yes"),
+                    ("TERM", "xterm-256color"),
+                    ("NO_COLOR", "1"),
+                    ("PROCESS_LAUNCHED_BY_Q", "1"),
+                    ("HISTFILE", ""),
+                    ("HISTCONTROL", "ignoreboth"),
+                ] {
+                    assert_eq!(variables.get(name), Some(&value), "{name} in {output:?}");
+                }
+                // Removed, never valid, and this process's own.
+                for name in ["CLICOLOR_FORCE", "BAD", "HOME"] {
+                    assert!(!variables.contains_key(name), "{name} in {output:?}");
+                }
+            }
+        });
+    }
+
+    /// What a hook passes to `executeCommand` goes on top, as it did in fterm.
+    #[cfg(unix)]
+    #[test]
+    fn a_hooks_own_variables_override_the_sessions() {
+        let script = r#"printf '%s|%s|%s' "$FROM_SESSION" "$FROM_HOOK" "$NO_COLOR""#;
+        let args = ["-c".to_string(), script.to_string()];
+        let hook = [
+            ("FROM_HOOK".to_string(), "hook".to_string()),
+            ("NO_COLOR".to_string(), "0".to_string()),
+        ];
+        in_session(&[("PATH", "/usr/bin:/bin"), ("FROM_SESSION", "session")], || {
+            let output = execute_full("sh", &args, "/", &hook, Duration::from_secs(5)).unwrap();
+            assert_eq!(output.stdout, "session|hook|0");
+        });
+    }
+
+    /// A few variables handed over for hooks to read are not a shell's
+    /// environment. Replacing ours with them would leave the command without
+    /// a `PATH`, so it starts exactly as it does outside a session.
+    #[cfg(unix)]
+    #[test]
+    fn a_list_without_path_leaves_the_environment_alone() {
+        let script = r#"printf '%s|%s' "${SESSION_ONLY-unset}" "${NO_COLOR-unset}""#;
+        let args = ["-c".to_string(), script.to_string()];
+        let outside = execute("sh", &args, "/", Duration::from_secs(5));
+        in_session(&[("SESSION_ONLY", "yes"), ("HOME", "/nonexistent")], || {
+            assert_eq!(execute("sh", &args, "/", Duration::from_secs(5)), outside);
+        });
+        assert!(outside.starts_with("unset|"), "{outside}");
+    }
+
+    /// The shells that list a login shell's commands and the custom history
+    /// source compute their own environment. Given the session's they would
+    /// act as that session's shell.
+    #[cfg(unix)]
+    #[test]
+    fn a_shell_run_for_its_own_environment_does_not_get_the_sessions() {
+        let dir = directory_linking("fastab-session-env", "/usr/bin/env");
+        let path = format!("{}:/usr/bin:/bin", dir.path().display());
+        let timeout = Duration::from_secs(5);
+        in_session(&[("PATH", path.as_str()), ("SESSION_ONLY", "yes")], || {
+            let output = try_execute_isolated_success("env", &[], "", timeout).expect("env is on our own PATH");
+            assert!(!printed_variables(&output).contains_key("SESSION_ONLY"), "{output:?}");
+            assert_eq!(
+                try_execute_isolated_success("fastab-session-env", &[], "", timeout),
+                None,
+                "and it is looked up on this process's PATH"
+            );
+            assert_eq!(
+                search_path().as_deref(),
+                Some(std::ffi::OsStr::new(&path)),
+                "the session's PATH is the one a typed command is found on"
+            );
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_program_is_looked_up_as_the_shell_would() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let first = tempfile::tempdir().unwrap();
+        let second = directory_linking("tool", "/usr/bin/env");
+        // Present earlier on the PATH, but not executable: the shell skips it.
+        std::fs::write(first.path().join("tool"), "").unwrap();
+        std::fs::set_permissions(first.path().join("tool"), std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::create_dir(second.path().join("bin")).unwrap();
+        std::os::unix::fs::symlink("/usr/bin/env", second.path().join("bin/nested")).unwrap();
+
+        let search = format!("{}:{}", first.path().display(), second.path().display());
+        assert_eq!(resolve_on_path("tool", &search, "/"), Some(second.path().join("tool")));
+        assert_eq!(resolve_on_path("absent", &search, "/"), None);
+        // A path is used as written, never searched for.
+        assert_eq!(resolve_on_path("./tool", &search, "/"), None);
+        assert_eq!(resolve_on_path("", &search, "/"), None);
+        // A directory is not a program.
+        assert_eq!(resolve_on_path("bin", &search, "/"), None);
+
+        // Relative entries, the empty one included, are the terminal's directory.
+        let cwd = second.path().display().to_string();
+        assert_eq!(
+            resolve_on_path("nested", "bin", &cwd),
+            Some(second.path().join("bin/nested"))
+        );
+        assert_eq!(
+            resolve_on_path("tool", "/nonexistent:", &cwd),
+            Some(second.path().join("tool"))
+        );
+        assert_eq!(resolve_on_path("nested", "bin", ""), None);
+
+        assert!(is_valid_variable("NAME", ""));
+        assert!(!is_valid_variable("", "value"));
+        assert!(!is_valid_variable("A=B", "value"));
+        assert!(!is_valid_variable("NAME", "nul\0inside"));
     }
 }

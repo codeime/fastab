@@ -1997,7 +1997,7 @@ fn first_token_path_and_alias_listing(request: &CompleteRequest) -> Vec<String> 
             names.insert(key);
         }
     }
-    if let Some(path) = std::env::var_os("PATH") {
+    if let Some(path) = crate::process::search_path() {
         for dir in std::env::split_paths(&path) {
             let Ok(entries) = std::fs::read_dir(dir) else {
                 continue;
