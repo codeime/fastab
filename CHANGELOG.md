@@ -1,5 +1,15 @@
 # Changelog
 
+## v0.0.27-beta.1
+
+- Test build, not offered as an update. Suggestions that come from running a command now run it with your terminal's `PATH` and environment. Since the move to the native app they ran with the app's own, which has only the system directories, so tools installed anywhere else (Homebrew, `docker`, `kubectl`, `cargo`, `node`) returned nothing, and variables such as `KUBECONFIG` and `AWS_PROFILE` were ignored. This is what the build is for checking. Those tools now also see your locale, so some of their output may come back translated.
+- fix: accepting a file or branch whose name holds `;` or a backquote no longer types it unquoted, where Enter ran what followed the `;`. A file with `$` in its name, such as `price$5.txt`, is quoted too. When the part Tab would add to a common prefix needs quoting, Tab accepts the row or leaves the line alone instead of typing half of it.
+- fix: a typo in a hand-edited `settings.json` no longer costs you the rest of the file. The app used to save its defaults over it at the next launch. It now leaves the file alone, and changes made in Settings are not saved until the file parses again.
+- fix: `ftab restart` and relaunching right after quitting no longer end with nothing running when the Settings window was open.
+- fix: the uninstall script keeps symlinked shell rc files and `~/.ssh/config` as links, and leaves files with no FasTab lines untouched.
+- fix: with `settings.json` kept as a symlink, a change made in the Settings window now reaches the running app.
+- change: if the app crashes while completing a command, `fastab.log` now records which command it was.
+
 ## v0.0.26
 
 - perf: closing Settings now gives its memory back. Settings runs in its own process, which exits when the window closes, so FasTab's main process no longer stays about 12 MB larger after you open it. While the window is open, Activity Monitor shows a second FasTab with about 50 MB. On the machine we tested, opening the window took about 0.3 s, or about 0.75 s when nothing was cached. The first time you open the menu bar menu still adds about 6 MB to the main process, once.
