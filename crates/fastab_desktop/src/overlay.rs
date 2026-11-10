@@ -1849,6 +1849,18 @@ impl OverlayController {
                     self.insert_selected(false, figterm_state, cx);
                     return true;
                 }
+                // A prefix is typed bare, with only its spaces escaped, so one
+                // that needs quoting cannot be typed in part: `a;b` from the
+                // files `a;b1` and `a;b2` would leave `cat a;b` on the line.
+                // Callers fall back to accepting the row, which quotes it. A
+                // closed quote is the exception: the edit below re-encodes
+                // the text for that quote.
+                if quote_aware
+                    && closed_shell_quote_inner(&raw_search).is_none()
+                    && tab_prefix_needs_quoting(&shared, &raw_search, query_term.as_deref(), &kind)
+                {
+                    return false;
+                }
                 let shared = escape_tab_prefix(&shared, &kind);
                 let search = prefix_insertion_search(&shared, &raw_search, query_term.as_deref());
                 let (insertion, deletion) = insertion_for(&shared, &search);
@@ -3068,7 +3080,7 @@ fn full_insertion_for_item(
         // The WebView escaped the completed value, including the separator
         // and cursor marker. This keeps the closing quote after `{cursor}` so
         // resolving the marker leaves the caret inside a quoted value.
-        escape_insertion(&value, is_folder)
+        escape_word(&value, is_folder, is_file_or_folder)
     };
 
     if execute && kind != "auto-execute" {
@@ -3109,11 +3121,51 @@ fn should_add_space(kind: &str, args_hint: &str) -> bool {
     }
 }
 
+/// Characters that keep an unquoted word from reaching the command as written.
+///
+/// Fig's list (`insertion.ts`, which the WebView shipped), plus `;` and the
+/// backquote. Without those two a file or a remote branch named
+/// `a;sh${IFS}payload` was typed unquoted, and Enter ran what followed the
+/// `;`. Braces are left out on purpose: they cannot run anything, and
+/// `stash@{0}` has always been accepted bare.
+const SHELL_SPECIAL: &[char] = &[
+    '\\', '?', '*', '\'', '"', '#', '|', '<', '>', '(', ')', '[', ']', '!', '&', ';', '`',
+];
+
+/// The file or folder name itself, without the directories before it.
+fn last_path_component(path: &str) -> &str {
+    let path = path.strip_suffix('/').unwrap_or(path);
+    path.rsplit('/').next().unwrap_or(path)
+}
+
+/// Whether `value` has to be quoted to stay one literal shell word.
+///
+/// A `$` counts only in a path's own name. Before the last `/` it is what the
+/// user typed and the path generator expanded (`$HOME/Doc` lists `$HOME/Documents/`),
+/// and other rows may name a variable to expand (`$PATH`). A file called
+/// `price$5.txt` is neither: unquoted, the shell opens `price.txt`.
+fn needs_quoting(value: &str, is_path: bool) -> bool {
+    value.chars().any(|ch| SHELL_SPECIAL.contains(&ch)) || (is_path && last_path_component(value).contains('$'))
+}
+
+/// Whether a Tab common prefix would put a character on the command line that
+/// accepting the row would have quoted. Only the part still to be typed
+/// counts: what is already there is the user's own spelling.
+fn tab_prefix_needs_quoting(shared: &str, raw_search: &str, query_term: Option<&str>, kind: &str) -> bool {
+    let typed = prefix_insertion_search(shared, raw_search, query_term);
+    let (untyped, _) = insertion_for(shared, &typed);
+    needs_quoting(&untyped, matches!(kind, "file" | "folder" | "dir"))
+}
+
+#[cfg(test)]
 fn escape_insertion(value: &str, is_folder: bool) -> String {
-    const SPECIAL: &[char] = &[
-        '\\', '?', '*', '\'', '"', '#', '|', '<', '>', '(', ')', '[', ']', '!', '&',
-    ];
-    if !value.chars().any(|ch| SPECIAL.contains(&ch)) {
+    escape_word(value, is_folder, is_folder)
+}
+
+/// `is_path` is true for file and folder rows; `is_folder` keeps the trailing
+/// slash outside the quotes.
+fn escape_word(value: &str, is_folder: bool, is_path: bool) -> String {
+    if !needs_quoting(value, is_path) {
         // JavaScript's `str.replace(/\s/g, "\\ ")` normalizes every
         // whitespace character to an escaped ASCII space.
         let mut escaped = String::with_capacity(value.len());
@@ -4461,6 +4513,59 @@ mod tests {
     fn escape_quotes_special_characters() {
         assert_eq!(escape_insertion("it's.txt", false), "'it'\"'\"'s.txt'");
         assert_eq!(escape_insertion("it's/", true), "'it'\"'\"'s'/");
+    }
+
+    /// Fig's list had neither `;` nor the backquote, so a name holding one was
+    /// typed bare and Enter ran what followed it.
+    #[test]
+    fn command_separators_and_substitutions_are_quoted() {
+        assert_eq!(escape_insertion("a;sh${IFS}payload", false), "'a;sh${IFS}payload'");
+        assert_eq!(escape_insertion("a`id`b", false), "'a`id`b'");
+        assert_eq!(escape_insertion("a;b/", true), "'a;b'/");
+        let arg = |name| full_insertion_for_item(name, None, "arg", None, false, false, false);
+        assert_eq!(arg("feature;rm"), "'feature;rm'");
+        // Rows that are not paths keep a `$` and braces, as they always have.
+        assert_eq!(arg("$PATH"), "$PATH");
+        assert_eq!(arg("stash@{0}"), "stash@{0}");
+    }
+
+    #[test]
+    fn a_dollar_in_a_file_name_is_quoted_but_not_in_the_typed_directory() {
+        let file = |name| full_insertion_for_item(name, None, "file", None, false, false, false);
+        let folder = |name| full_insertion_for_item(name, None, "folder", None, false, false, false);
+        assert_eq!(file("price$5.txt"), "'price$5.txt'");
+        assert_eq!(file("src/price$5.txt"), "'src/price$5.txt'");
+        assert_eq!(folder("a$b/"), "'a$b'/");
+        // `$HOME/Doc` lists `$HOME/Documents/`: that `$` is the user's.
+        assert_eq!(folder("$HOME/Documents/"), "$HOME/Documents/");
+        assert_eq!(file("$HOME/notes.txt"), "$HOME/notes.txt");
+        assert_eq!(file("~/notes.txt"), "~/notes.txt");
+    }
+
+    #[test]
+    fn a_tab_prefix_that_needs_quoting_is_not_typed_in_part() {
+        assert!(tab_prefix_needs_quoting("a;b", "a", None, "file"));
+        assert!(tab_prefix_needs_quoting("a(b", "a", None, "file"));
+        assert!(tab_prefix_needs_quoting("pri$ce", "pr", None, "file"));
+        assert!(tab_prefix_needs_quoting("feature;x", "fea", None, "arg"));
+        // A replacement types the whole prefix.
+        assert!(tab_prefix_needs_quoting("a;b", "A", None, "file"));
+        // Spaces are escaped, not quoted.
+        assert!(!tab_prefix_needs_quoting("my file", "my", None, "file"));
+        // What is already on the line is the user's own spelling.
+        assert!(!tab_prefix_needs_quoting(
+            "Screenshot (1",
+            r"Screenshot\ \(",
+            None,
+            "file"
+        ));
+        assert!(!tab_prefix_needs_quoting(
+            "$HOME/Documents",
+            "$HOME/Doc",
+            None,
+            "folder"
+        ));
+        assert!(!tab_prefix_needs_quoting("$PATH", "$PA", None, "arg"));
     }
 
     #[test]
