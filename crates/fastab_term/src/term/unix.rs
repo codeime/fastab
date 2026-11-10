@@ -376,10 +376,17 @@ async fn read_input_stream(
 
 impl Drop for UnixTerminal {
     fn drop(&mut self) {
-        self.write.flush().unwrap();
-        self.write
-            .set_termios(&self.saved_termios, SetAttributeWhen::Now)
-            .expect("failed to restore original termios state");
+        // Best effort. The terminal can be gone by now (its window closed
+        // while this process was not the one to get SIGHUP), and then
+        // `tcdrain` and `tcsetattr` fail with EIO. There is nothing left to
+        // restore in that case, and a panic here aborts the shipped build on
+        // its way out, leaving a crash report for an ordinary exit.
+        if let Err(err) = self.write.flush() {
+            tracing::debug!(%err, "Could not flush the terminal before restoring it");
+        }
+        if let Err(err) = self.write.set_termios(&self.saved_termios, SetAttributeWhen::Now) {
+            tracing::debug!(%err, "Could not restore the terminal's original mode");
+        }
     }
 }
 
