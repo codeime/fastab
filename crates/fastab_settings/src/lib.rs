@@ -9,6 +9,7 @@ pub mod state;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, SystemTime};
 
 pub use error::{Error, Result};
@@ -26,6 +27,10 @@ pub type Map = serde_json::Map<String, Value>;
 static SETTINGS_FILE_LOCK: RwLock<()> = RwLock::new(());
 
 static SETTINGS_DATA: RwLock<Option<Map>> = RwLock::new(None);
+
+/// Set while `SETTINGS_DATA` is not what the settings file holds, because the
+/// file did not load. See [`JsonStore::ensure_loaded`].
+static SETTINGS_LOAD_FAILED: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone)]
 pub enum Backend {
@@ -173,6 +178,10 @@ pub trait JsonStore: Sized {
     /// [RwLock] on the data, [None] if not using the global backend
     fn data_lock() -> &'static RwLock<Option<Map>>;
 
+    /// Set while the global backend's data is not the file's contents,
+    /// because the file did not load.
+    fn load_failed() -> &'static AtomicBool;
+
     fn new_from_backend(backend: Backend) -> Self;
 
     fn map(&self) -> ReadGuard<'_, Map>;
@@ -194,18 +203,51 @@ pub trait JsonStore: Sized {
         read_json_object(&path)
     }
 
+    /// Makes `map`, just read from the file, the global backend's data.
+    fn replace_global(map: Map) {
+        *Self::data_lock().write() = Some(map);
+        Self::load_failed().store(false, Ordering::Release);
+    }
+
+    /// Records that the file no longer loads, so the global backend's data is
+    /// not what it holds. A watcher that fails to re-read a changed file calls
+    /// this; the data it already has stays in use for reads.
+    fn mark_load_failed() {
+        Self::load_failed().store(true, Ordering::Release);
+    }
+
+    /// Call before changing the global backend's data.
+    ///
+    /// While the file has not loaded, that data stands in for it (an empty map
+    /// after a failed start, the last good copy after a failed re-read), and
+    /// saving it would replace the user's file: a typo in a hand edit used to
+    /// cost every other setting the next time anything was written, which the
+    /// desktop app did on every launch. So the file is read again first. Once
+    /// it loads, its contents are the data to change; until then the change
+    /// is refused and nothing is written, as it always was for a process that
+    /// reads the file per call (`ftab settings`).
+    fn ensure_loaded() -> Result<()> {
+        if Self::load_failed().load(Ordering::Acquire) {
+            let map = Self::load_from_file()
+                .inspect_err(|err| error!(%err, "Not saving a setting: the settings file does not load"))?;
+            Self::replace_global(map);
+        }
+        Ok(())
+    }
+
     /// Loads data from file into global backend
     fn load_into_global() -> Result<()> {
         match Self::load_from_file() {
             Ok(json) => {
-                *Self::data_lock().write() = Some(json);
+                Self::replace_global(json);
                 Ok(())
             },
             Err(err) => {
-                // Run on defaults, but never write them back here: every new
+                // Run on defaults, but never write them back: every new
                 // terminal tab loads this file, so a hand-edit typo or a read
                 // racing a writer would otherwise wipe the user's settings.
                 *Self::data_lock().write() = Some(Map::new());
+                Self::mark_load_failed();
 
                 let backup = match (&err, Self::path()) {
                     (Error::JsonError(_), Ok(path)) => {
@@ -222,6 +264,11 @@ pub trait JsonStore: Sized {
     }
 
     fn save_to_file(&self) -> Result<()> {
+        // A caller that skipped `ensure_loaded` still must not save stand-in
+        // data over the file.
+        if Self::load_failed().load(Ordering::Acquire) {
+            return Err(Error::FileNotLoaded);
+        }
         let path = Self::path()?;
         let _lock_guard = Self::file_lock().write();
         write_json_object_atomically(&path, &self.map())
@@ -280,7 +327,7 @@ const KEPT_INVALID_BACKUPS: usize = 3;
 /// that file does not exist yet. A dotfile-managed link keeps pointing at its
 /// target: writes land there, and a dangling link gets its target created
 /// rather than failing every load and save.
-fn resolve_data_file(path: &Path) -> std::io::Result<PathBuf> {
+pub fn resolve_data_file(path: &Path) -> std::io::Result<PathBuf> {
     let mut current = path.to_path_buf();
     for _ in 0..32 {
         match fs::symlink_metadata(&current) {
@@ -474,6 +521,10 @@ impl JsonStore for OldSettings {
         &SETTINGS_DATA
     }
 
+    fn load_failed() -> &'static AtomicBool {
+        &SETTINGS_LOAD_FAILED
+    }
+
     fn new_from_backend(backend: Backend) -> Self {
         match backend {
             Backend::Global => Self { inner: Backend::Global },
@@ -581,6 +632,103 @@ mod file_tests {
         let path = dir.path().join("settings.json");
         fs::write(&path, "  \n").unwrap();
         assert_eq!(read_json_object(&path).unwrap(), Map::new());
+    }
+
+    /// A store with its own file and statics, so one test owns all of its
+    /// global state.
+    struct LoadStore {
+        inner: Backend,
+    }
+
+    static LOAD_STORE_PATH: RwLock<Option<PathBuf>> = RwLock::new(None);
+    static LOAD_STORE_FILE_LOCK: RwLock<()> = RwLock::new(());
+    static LOAD_STORE_DATA: RwLock<Option<Map>> = RwLock::new(None);
+    static LOAD_STORE_FAILED: AtomicBool = AtomicBool::new(false);
+
+    impl JsonStore for LoadStore {
+        fn path() -> Result<PathBuf> {
+            Ok(LOAD_STORE_PATH.read().clone().expect("the test set a path"))
+        }
+
+        fn file_lock() -> &'static RwLock<()> {
+            &LOAD_STORE_FILE_LOCK
+        }
+
+        fn data_lock() -> &'static RwLock<Option<Map>> {
+            &LOAD_STORE_DATA
+        }
+
+        fn load_failed() -> &'static AtomicBool {
+            &LOAD_STORE_FAILED
+        }
+
+        fn new_from_backend(backend: Backend) -> Self {
+            Self { inner: backend }
+        }
+
+        fn map(&self) -> ReadGuard<'_, Map> {
+            match &self.inner {
+                Backend::Global => ReadGuard::Global(Self::data_lock().read()),
+                Backend::Memory(map) => ReadGuard::Memory(map),
+            }
+        }
+
+        fn map_mut(&mut self) -> WriteGuard<'_, Map> {
+            match &mut self.inner {
+                Backend::Global => WriteGuard::Global(Self::data_lock().write()),
+                Backend::Memory(map) => WriteGuard::Memory(map),
+            }
+        }
+    }
+
+    /// What `Settings::set_value` does for the real store.
+    fn set_in_load_store(key: &str, value: bool) -> Result<()> {
+        LoadStore::ensure_loaded()?;
+        let mut store = LoadStore::load()?;
+        store.set(key, value);
+        store.save_to_file()
+    }
+
+    /// The desktop app sets a key on every launch. With a typo in a hand-edited
+    /// file that write used to save the defaults it was running on over
+    /// everything else in the file.
+    #[test]
+    fn a_file_that_did_not_load_is_not_written_until_it_does() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        *LOAD_STORE_PATH.write() = Some(path.clone());
+        let broken = "{\"theme\": \"dark\", \"keep\": 1,}";
+        fs::write(&path, broken).unwrap();
+
+        assert!(matches!(LoadStore::load_into_global(), Err(Error::JsonError(_))));
+        assert_eq!(LoadStore::load().unwrap().get_string("theme"), None, "runs on defaults");
+        assert!(matches!(
+            set_in_load_store("app.launchOnStartup", true),
+            Err(Error::JsonError(_))
+        ));
+        // A caller that changes the data without asking first cannot save it either.
+        let mut store = LoadStore::load().unwrap();
+        store.set("stray", true);
+        assert!(matches!(store.save_to_file(), Err(Error::FileNotLoaded)));
+        assert_eq!(fs::read_to_string(&path).unwrap(), broken);
+
+        // Once the typo is fixed the file is the data again, and writes resume.
+        fs::write(&path, "{\"theme\": \"dark\", \"keep\": 1}").unwrap();
+        set_in_load_store("app.launchOnStartup", true).unwrap();
+        assert_eq!(
+            read_json_object(&path).unwrap(),
+            object(r#"{"theme": "dark", "keep": 1, "app.launchOnStartup": true}"#),
+            "nothing set while the file was unreadable leaks into it"
+        );
+
+        // A watcher that fails to re-read an edit keeps its last good copy for
+        // reads, and does not save that copy over the edit.
+        let edited = "{\"theme\": \"light\",";
+        fs::write(&path, edited).unwrap();
+        LoadStore::mark_load_failed();
+        assert_eq!(LoadStore::load().unwrap().get_string("theme").as_deref(), Some("dark"));
+        assert!(set_in_load_store("other", true).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), edited);
     }
 
     #[test]

@@ -54,6 +54,24 @@ pub fn desktop_app_running() -> bool {
     !running_applications.is_empty()
 }
 
+/// Waits for the app to be gone, for at most `timeout`. True once it is.
+///
+/// "The app" is every process with its bundle id. That includes the Settings
+/// window's own process, which notices that the desktop app quit and follows
+/// it, by force after two seconds if its UI thread is busy.
+pub async fn wait_for_desktop_app_exit(timeout: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if !desktop_app_running() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+}
+
 #[cfg(target_os = "windows")]
 pub fn desktop_app_running() -> bool {
     use crate::consts::APP_PROCESS_NAME;

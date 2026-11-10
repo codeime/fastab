@@ -246,9 +246,19 @@ incremental = true
 lto = "off"
 
 # Distribution profile used by scripts/build-app.sh and the release CI job.
-# Optimizes for binary size and runtime over compile speed. `panic = "abort"`
-# is safe here: no crate uses catch_unwind or a panic hook, and fuzz/tests run
-# under their own profiles.
+# Optimizes for binary size and runtime over compile speed.
+#
+# `panic = "abort"` makes every panic fatal to its process. That is wanted for
+# fterm, ftab and the input method. It also means the engine's `catch_unwind`
+# around a completion attempt (fastab_engine/src/worker.rs) does nothing in a
+# shipped desktop app: a panicking attempt takes the app down, and the desktop's
+# panic hook records it in fastab.log first. Tests run under their own profile,
+# where that `catch_unwind` does work. Do not switch the desktop to unwinding
+# without checking an installed build: an Objective-C exception that crosses an
+# `extern "C"` Rust callback passes through an aborting build and aborts an
+# unwinding one. Any edit to these tables (comments aside) also changes the
+# input method's code digest (fastab_input_method/build.rs), which replaces the
+# running helper on the next update.
 [profile.dist]
 inherits = "release"
 # Line tables go to a dSYM beside each binary (rustc runs dsymutil before it

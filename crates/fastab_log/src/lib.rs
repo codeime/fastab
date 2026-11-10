@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Mutex;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use thiserror::Error;
 use tracing::info;
@@ -111,6 +112,47 @@ pub fn initialize_logging<T: AsRef<Path>>(args: LogArgs<T>) -> Result<LogGuard, 
         _file_guard,
         _stdout_guard,
     })
+}
+
+/// Writes one ERROR record to the log file at `path`, on the calling thread.
+///
+/// Every other record goes through a writer thread, so one made just before
+/// the process dies is still queued when it does. A panic hook uses this: the
+/// shipped binaries abort on a panic, and their stderr is `/dev/null` under
+/// LaunchServices, so nothing else would say what happened.
+pub fn write_error_now(path: &Path, message: &str) -> std::io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = rolling::RollingFile::new(path, false)?;
+    let record = format!("{} ERROR {message}\n", utc_timestamp(SystemTime::now()));
+    file.write_all(record.as_bytes())
+}
+
+/// `2026-11-10T08:15:30Z`, from the standard library alone.
+fn utc_timestamp(time: SystemTime) -> String {
+    let seconds = time.duration_since(UNIX_EPOCH).map_or(0, |since| since.as_secs());
+    let second_of_day = seconds % 86_400;
+    // Days since 1970-01-01 to a calendar date: Howard Hinnant's
+    // `civil_from_days`, for dates at or after the epoch.
+    let days = i64::try_from(seconds / 86_400).unwrap_or(0) + 719_468;
+    let era = days / 146_097;
+    let day_of_era = days % 146_097;
+    let year_of_era = (day_of_era - day_of_era / 1_460 + day_of_era / 36_524 - day_of_era / 146_096) / 365;
+    let day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
+    let month_index = (5 * day_of_year + 2) / 153;
+    let day = day_of_year - (153 * month_index + 2) / 5 + 1;
+    let month = if month_index < 10 {
+        month_index + 3
+    } else {
+        month_index - 9
+    };
+    let year = year_of_era + era * 400 + i64::from(month <= 2);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}:{:02}:{:02}Z",
+        second_of_day / 3_600,
+        second_of_day % 3_600 / 60,
+        second_of_day % 60
+    )
 }
 
 /// Get the current log level by first seeing if it is set in application, then environment, then
@@ -241,6 +283,33 @@ mod tests {
         producer.join().unwrap();
         drop(guard);
         assert_eq!(dropped.unwrap(), 1);
+    }
+
+    #[test]
+    fn an_error_written_now_is_on_disk_when_the_call_returns() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("panic.log");
+        write_error_now(&path, "panic on thread \"main\": boom").unwrap();
+        write_error_now(&path, "second").unwrap();
+
+        let contents = read_to_string(&path).unwrap();
+        let lines: Vec<_> = contents.lines().collect();
+        assert_eq!(lines.len(), 2, "{contents}");
+        assert!(
+            lines[0].ends_with("Z ERROR panic on thread \"main\": boom"),
+            "{contents}"
+        );
+        assert!(lines[1].ends_with("Z ERROR second"), "{contents}");
+    }
+
+    #[test]
+    fn timestamps_are_utc_calendar_dates() {
+        let at = |seconds| utc_timestamp(UNIX_EPOCH + Duration::from_secs(seconds));
+        assert_eq!(at(0), "1970-01-01T00:00:00Z");
+        assert_eq!(at(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(at(1_700_000_000), "2023-11-14T22:13:20Z");
+        assert_eq!(at(1_709_208_000), "2024-02-29T12:00:00Z");
+        assert_eq!(at(4_102_444_799), "2099-12-31T23:59:59Z");
     }
 
     #[test]

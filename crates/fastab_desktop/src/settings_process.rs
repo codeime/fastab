@@ -41,7 +41,7 @@ use crate::settings_ui::{self, SettingsHandle};
 use crate::webview::DASHBOARD_ID;
 
 pub(crate) const SETTINGS_WINDOW_FLAG: &str = "--settings-window";
-const LOG_FILE_NAME: &str = "fastab-settings.log";
+pub(crate) const LOG_FILE_NAME: &str = "fastab-settings.log";
 
 /// How long a launched process has to connect before the desktop app gives up
 /// on it. It connects before it opens anything, so this only bounds a launch
@@ -144,8 +144,27 @@ impl SettingsProcess {
     }
 }
 
+/// The `.app` that holds the executable at `exe`, whatever it is called.
+///
+/// `fastab_util::app_bundle_path_opt` only knows a bundle named `Fastab.app`.
+/// A renamed copy fell through to the direct spawn below, which is the launch
+/// macOS 27 does not treat as a GUI app.
+fn enclosing_bundle(exe: &Path) -> Option<PathBuf> {
+    let macos = exe.parent()?;
+    let contents = macos.parent()?;
+    let bundle = contents.parent()?;
+    (macos.file_name()? == "MacOS" && contents.file_name()? == "Contents" && bundle.extension()? == "app")
+        .then(|| bundle.to_path_buf())
+}
+
 fn launcher_command(socket: &Path) -> std::io::Result<tokio::process::Command> {
-    let mut command = match fastab_util::app_bundle_path_opt() {
+    let bundle = fastab_util::app_bundle_path_opt().or_else(|| {
+        fastab_util::current_exe_origin()
+            .ok()
+            .as_deref()
+            .and_then(enclosing_bundle)
+    });
+    let mut command = match bundle {
         Some(bundle) => {
             let mut open = tokio::process::Command::new("/usr/bin/open");
             open.arg("-n").arg(bundle).arg("--args");
@@ -557,6 +576,25 @@ mod tests {
             HostMessage::RefreshPermissions.into_window_event(),
             WindowEvent::Reload
         ));
+    }
+
+    #[test]
+    fn a_renamed_bundle_is_still_opened_as_a_bundle() {
+        use std::path::Path;
+
+        let bundle = |exe: &str| super::enclosing_bundle(Path::new(exe));
+        assert_eq!(
+            bundle("/Applications/Fastab.app/Contents/MacOS/fastab"),
+            Some(PathBuf::from("/Applications/Fastab.app"))
+        );
+        assert_eq!(
+            bundle("/Users/me/Apps/Fastab 2.app/Contents/MacOS/fastab"),
+            Some(PathBuf::from("/Users/me/Apps/Fastab 2.app"))
+        );
+        // A development build has no bundle to open.
+        assert_eq!(bundle("/repo/target/debug/fastab"), None);
+        assert_eq!(bundle("/repo/Contents/MacOS/fastab"), None);
+        assert_eq!(bundle("/Fastab.app/Contents/Helpers/fastab"), None);
     }
 
     #[test]

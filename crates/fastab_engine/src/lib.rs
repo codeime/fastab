@@ -46,6 +46,6 @@ pub use rank::{ACCEPTANCE_STATE_KEY, AcceptanceIndex};
 pub use runtime::{CompleteRequest, CompleteResult, CurrentArg, Engine, Suggestion, ranking_root_command};
 pub use spec_pair::public_ai_baseline_ok;
 pub use worker::{
-    CompletionTask, EngineClient, EngineClientOptions, SessionId, default_specs_dir, engine_attempt_timeout,
-    ui_completion_deadline,
+    CompletionTask, EngineClient, EngineClientOptions, SessionId, attempt_context_for_panic, default_specs_dir,
+    engine_attempt_timeout, ui_completion_deadline,
 };

@@ -57,10 +57,42 @@ struct Launch {
     _log_guard: fastab_log::LogGuard,
 }
 
+const LOG_FILE_NAME: &str = "fastab.log";
+
+/// Leaves a record of a panic in this process's log file.
+///
+/// The shipped build aborts on a panic (`panic = "abort"` in the `dist`
+/// profile), LaunchServices points stderr at `/dev/null`, and the logger hands
+/// its records to a writer thread that dies with the process, so until this
+/// the app just vanished from the menu bar. That includes a panic inside a
+/// completion attempt: the engine's `catch_unwind` isolates one only in a
+/// build that unwinds, and the hook names the command it was completing.
+fn record_panics(log_file_name: &'static str) {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        if let Ok(dir) = directories::logs_dir() {
+            let thread = std::thread::current();
+            let thread = thread.name().unwrap_or("unnamed");
+            let attempt = match fastab_engine::attempt_context_for_panic() {
+                Some(context) => format!(" while completing {context}"),
+                None => String::new(),
+            };
+            let message = format!("panic on thread {thread:?}{attempt}: {info}");
+            let _ = fastab_log::write_error_now(&dir.join(log_file_name), &message);
+        }
+        default_hook(info);
+    }));
+}
+
 fn main() -> ExitCode {
     fastab_util::malloc::clear_space_efficient();
     fastab_util::build_identity::initialize();
     let cli = cli::Cli::parse();
+    record_panics(if cli.settings_window.is_some() {
+        settings_process::LOG_FILE_NAME
+    } else {
+        LOG_FILE_NAME
+    });
     // The desktop process is I/O bound: GPUI owns the UI thread, and the
     // completion engine has its own worker. A worker per core just parks
     // stacks — the same waste ecterm already stopped.
@@ -166,7 +198,7 @@ async fn async_main(cli: cli::Cli) -> Result<Launch, ExitCode> {
         log_file_path: Some(
             directories::logs_dir()
                 .expect("home dir must be set")
-                .join("fastab.log"),
+                .join(LOG_FILE_NAME),
         ),
         delete_old_log_file: false,
     })
@@ -222,7 +254,14 @@ async fn async_main(cli: cli::Cli) -> Result<Launch, ExitCode> {
                 launch_on_startup = enabled;
             }
 
-            fastab_settings::settings::set_value("app.launchOnStartup", launch_on_startup).ok();
+            // Only when it changed: this used to rewrite settings.json, and
+            // wake every process watching it, on each launch.
+            let saved = fastab_settings::settings::get_bool("app.launchOnStartup")
+                .ok()
+                .flatten();
+            if saved != Some(launch_on_startup) {
+                fastab_settings::settings::set_value("app.launchOnStartup", launch_on_startup).ok();
+            }
             fastab_settings::state::set_value(LOGIN_ITEM_MIGRATED_KEY, true).ok();
         } else if let Err(err) = fastab_integrations::login_item::reconcile(launch_on_startup) {
             warn!(%err, "failed to reconcile legacy launch-at-login registration");
@@ -468,6 +507,14 @@ async fn stop_instances(pids: &[i32]) {
     wait_for_exit(pids, std::time::Duration::from_millis(500)).await;
 }
 
+/// How long a process that shares our bundle id but does not answer on the
+/// desktop socket gets to exit, or to start answering. Longer than the Settings
+/// process's forced-exit grace (`settings_process::FORCED_EXIT_GRACE`).
+#[cfg(target_os = "macos")]
+const OTHER_INSTANCE_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
+#[cfg(target_os = "macos")]
+const OTHER_INSTANCE_POLL: std::time::Duration = std::time::Duration::from_millis(100);
+
 #[cfg(target_os = "macos")]
 #[must_use]
 async fn allow_multiple_running_check(current_pid: u32, kill_old: bool, page: Option<String>) -> Option<ExitCode> {
@@ -494,10 +541,29 @@ async fn allow_multiple_running_check(current_pid: u32, kill_old: bool, page: Op
         Some(page) => eprintln!("Opening /{page}..."),
         None => eprintln!("Opening {PRODUCT_NAME} Window..."),
     }
-    if let Err(err) = fastab_ipc::local::open_ui_element(fastab_proto::local::UiElement::MissionControl, page).await {
-        eprintln!("Failed to open {PRODUCT_NAME}: {err}");
+    // A process with our bundle id is not necessarily the desktop app: the
+    // Settings window runs in one of its own, which outlives a desktop app
+    // that just quit by up to its forced-exit grace. Taking it for a running
+    // app made a relaunch during that time exit here, leaving nothing running.
+    // The desktop app is whichever process answers on its socket, so when
+    // nothing does, wait for the others to go and start, or for a desktop app
+    // that is still starting to answer.
+    let deadline = std::time::Instant::now() + OTHER_INSTANCE_GRACE;
+    loop {
+        let element = fastab_proto::local::UiElement::MissionControl;
+        let err = match fastab_ipc::local::open_ui_element(element, page.clone()).await {
+            Ok(()) => return Some(ExitCode::SUCCESS),
+            Err(err) => err,
+        };
+        if wait_for_exit(&others, OTHER_INSTANCE_POLL).await {
+            eprintln!("It has exited; starting {PRODUCT_NAME}");
+            return None;
+        }
+        if std::time::Instant::now() >= deadline {
+            eprintln!("Failed to open {PRODUCT_NAME}: {err}");
+            return Some(ExitCode::SUCCESS);
+        }
     }
-    Some(ExitCode::SUCCESS)
 }
 
 #[cfg(all(test, target_os = "macos"))]

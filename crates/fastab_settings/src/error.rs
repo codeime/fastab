@@ -22,6 +22,8 @@ pub enum Error {
     DirectoryError(#[from] directories::DirectoryError),
     #[error("memory backend is not used")]
     MemoryBackendNotUsed,
+    #[error("the settings file could not be loaded; it is left as it is until it can be")]
+    FileNotLoaded,
     #[error(transparent)]
     Rusqlite(#[from] rusqlite::Error),
     #[error(transparent)]
@@ -52,6 +54,7 @@ mod tests {
             Error::SettingsNotObject,
             directories::DirectoryError::NoHomeDirectory.into(),
             Error::MemoryBackendNotUsed,
+            Error::FileNotLoaded,
             rusqlite::Error::SqliteSingleThreadedMode.into(),
             // r2d2::Error
             DbOpenError("oops".into()).into(),

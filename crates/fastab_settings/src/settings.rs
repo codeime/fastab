@@ -64,6 +64,7 @@ impl Settings {
     pub fn set_value(&self, key: impl Into<String>, value: impl Into<serde_json::Value>) -> Result<()> {
         match &self.0 {
             inner::Inner::Real => {
+                OldSettings::ensure_loaded()?;
                 let mut settings = OldSettings::load()?;
                 settings.set(key, value);
                 settings.save_to_file()?;
@@ -79,6 +80,7 @@ impl Settings {
     pub fn remove_value(&self, key: impl AsRef<str>) -> Result<()> {
         match &self.0 {
             inner::Inner::Real => {
+                OldSettings::ensure_loaded()?;
                 let mut settings = OldSettings::load()?;
                 settings.remove(key);
                 settings.save_to_file()?;

@@ -11,7 +11,7 @@ use fastab_settings::{settings, state};
 use fastab_util::{CLI_BINARY_NAME, PRODUCT_NAME, manifest};
 use tracing::{info, trace};
 
-use crate::util::desktop::{LaunchArgs, desktop_app_running, launch_fastab_desktop};
+use crate::util::desktop::{LaunchArgs, desktop_app_running, launch_fastab_desktop, wait_for_desktop_app_exit};
 
 #[derive(Debug, Args, PartialEq, Eq)]
 pub struct UninstallArgs {
@@ -90,6 +90,11 @@ pub async fn restart_fig() -> Result<()> {
         println!("Restarting {PRODUCT_NAME}");
         crate::util::quit_fig(false).await?;
         tokio::time::sleep(Duration::from_millis(1000)).await;
+        // `launch_fastab_desktop` does nothing while the app still looks
+        // running, and a second was not always enough: the Settings window's
+        // process shares the bundle id and can take two more to follow the
+        // desktop app out, so the restart ended with nothing running.
+        wait_for_desktop_app_exit(Duration::from_secs(4)).await;
         launch_fastab_desktop(LaunchArgs {
             wait_for_socket: true,
             open_dashboard: false,

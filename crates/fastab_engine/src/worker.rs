@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -718,7 +719,11 @@ impl EngineClient {
                     // Registry capture and refresh may block in a filesystem
                     // call too. They belong inside the same watchdog boundary
                     // as generators, never on the supervisor itself.
+                    let panic_context = attempt_context.clone();
                     let outcome = run_supervised(attempt_timeout, Arc::clone(&operations), move || {
+                        // Each attempt has a thread of its own, so this needs
+                        // no clearing.
+                        ATTEMPT_CONTEXT.with(|context| *context.borrow_mut() = Some(panic_context));
                         let _scope = crate::cancellation::enter(attempt_token);
                         let initialized = current_engine.is_none();
                         let built = match current_engine {
@@ -1072,6 +1077,10 @@ fn run_supervised<T: Send + 'static>(
         .stack_size(ENGINE_THREAD_STACK)
         .spawn(move || {
             let _guard = guard;
+            // Catches a panic only where panics unwind (dev, test, release).
+            // The shipped `dist` profile aborts: there a panic in an attempt
+            // ends the process, and the host's panic hook is what records it
+            // (`attempt_context_for_panic`).
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation));
             let message = match outcome {
                 Ok(result) => Ok(result),
@@ -1098,6 +1107,25 @@ fn run_supervised<T: Send + 'static>(
 fn attempt_log_context(request: &CompleteRequest) -> String {
     let root = request.buffer.split_whitespace().next().unwrap_or("");
     format!("root_command={root:?} cwd={:?}", request.cwd)
+}
+
+thread_local! {
+    /// What the completion attempt running on this thread is completing.
+    static ATTEMPT_CONTEXT: RefCell<Option<String>> = const { RefCell::new(None) };
+}
+
+/// The root command and working directory of the completion attempt running
+/// on the calling thread, for the host's panic hook.
+///
+/// `run_supervised` catches a panicking attempt only in a build that unwinds.
+/// The shipped `dist` profile aborts instead, so there the supervisor never
+/// gets to log which command it was: the process is gone. A panic hook still
+/// runs first, on the panicking thread, and this is what it can say.
+pub fn attempt_context_for_panic() -> Option<String> {
+    ATTEMPT_CONTEXT
+        .try_with(|context| context.try_borrow().ok().and_then(|context| context.clone()))
+        .ok()
+        .flatten()
 }
 
 fn record_acceptance(
@@ -2729,6 +2757,31 @@ mod tests {
         let (_, result) = run_engine_attempt(fresh_engine, CompleteRequest::default(), Duration::from_secs(1))
             .expect("fresh attempt should run after a panic");
         assert!(result.is_ok());
+    }
+
+    /// The shipped build aborts on that same panic, so the host's panic hook
+    /// has to be able to say what the thread was completing.
+    #[test]
+    fn a_panic_hook_can_name_what_an_attempt_thread_is_completing() {
+        assert_eq!(attempt_context_for_panic(), None);
+        let request = CompleteRequest {
+            buffer: "git checkout ma".into(),
+            cwd: "/repo".into(),
+            ..CompleteRequest::default()
+        };
+        let context = attempt_log_context(&request);
+        let seen = thread::spawn(move || {
+            ATTEMPT_CONTEXT.with(|slot| *slot.borrow_mut() = Some(context));
+            attempt_context_for_panic()
+        })
+        .join()
+        .unwrap();
+        assert_eq!(seen.as_deref(), Some(r#"root_command="git" cwd="/repo""#));
+        assert_eq!(
+            attempt_context_for_panic(),
+            None,
+            "another thread's attempt is not ours"
+        );
     }
 
     fn write_idle_specs(dir: &std::path::Path) {

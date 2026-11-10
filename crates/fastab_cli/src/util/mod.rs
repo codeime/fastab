@@ -135,20 +135,19 @@ pub async fn quit_fig(verbose: bool) -> Result<ExitCode> {
                         }
                     }
                 } else if #[cfg(target_os = "macos")] {
-                    if let Ok(info) = get_app_info() {
-                        let pid = Regex::new(r"pid = (\S+)")
-                            .unwrap()
-                            .captures(&info)
-                            .and_then(|c| c.get(1));
-                        if let Some(pid) = pid {
-                            let success = Command::new("kill")
-                                .arg("-KILL")
-                                .arg(pid.as_str())
-                                .status()
-                                .map(|res| res.success());
-                            if let Ok(true) = success {
-                                return Ok(ExitCode::SUCCESS);
-                            }
+                    // Every process of the bundle, not the one `lsappinfo`
+                    // happens to name: with the Settings window open that can
+                    // be its process, and killing only that one reported the
+                    // app as quit while the desktop app kept running.
+                    let pids = macos_utils::applications::running_application_pids(APP_BUNDLE_ID);
+                    if !pids.is_empty() {
+                        let success = Command::new("kill")
+                            .arg("-KILL")
+                            .args(pids.iter().map(ToString::to_string))
+                            .status()
+                            .map(|res| res.success());
+                        if let Ok(true) = success {
+                            return Ok(ExitCode::SUCCESS);
                         }
                     }
                 } else if #[cfg(target_os = "windows")] {
